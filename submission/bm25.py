@@ -27,14 +27,18 @@ controls document-length normalisation strength. Both must be exposed as
 parameters, not hard-coded — you need to sweep them for your report
 (assignment Section 8, "parameter search procedure for k1, b").
 """
-from typing import List, Tuple
+import math
+from typing import Dict, List, Optional, Tuple
 
-from submission.indexer import InvertedIndex
+from submission.indexer import InvertedIndex, tokenize
+
+_INDEX: Optional[InvertedIndex] = None
+_IDF: Dict[str, float] = {}
 
 
 def build(index: InvertedIndex) -> None:
-    """Optional: precompute anything BM25-specific (e.g. cached IDF values
-    per term) from the InvertedIndex built in indexer.py.
+    """Precompute per-term IDF values (Robertson-Sparck Jones, +1-smoothed)
+    from the InvertedIndex built in indexer.py.
 
     Call this from retrieve.load_index(), not retrieve.build_index() —
     the harness runs those two in separate processes, so any cache this
@@ -43,10 +47,32 @@ def build(index: InvertedIndex) -> None:
     build/load boundary too, write it out via InvertedIndex.save() instead
     (it then counts toward your index-size score) and rebuild the cache
     here from the loaded index."""
-    raise NotImplementedError
+    global _INDEX, _IDF
+    _INDEX = index
+    N = index.N
+    _IDF = {}
+    for term in index.postings:
+        df = index.document_frequency(term)
+        _IDF[term] = math.log((N - df + 0.5) / (df + 0.5) + 1)
 
 
 def score(query: str, k: int, k1: float = 1.2, b: float = 0.75) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs for `query`, BM25-ranked,
     highest score first."""
-    raise NotImplementedError
+    if _INDEX is None:
+        raise RuntimeError("bm25.build() must be called before bm25.score().")
+
+    avgdl = _INDEX.avg_doc_len or 1.0
+    scores: Dict[str, float] = {}
+    for term in tokenize(query):
+        postings = _INDEX.postings.get(term)
+        if not postings:
+            continue
+        idf = _IDF.get(term, 0.0)
+        for doc_id, tf in postings.items():
+            dl = _INDEX.doc_len.get(doc_id, 0)
+            denom = tf + k1 * (1 - b + b * dl / avgdl)
+            scores[doc_id] = scores.get(doc_id, 0.0) + idf * (tf * (k1 + 1)) / denom
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    return ranked[:k]

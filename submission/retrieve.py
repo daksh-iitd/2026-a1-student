@@ -41,79 +41,65 @@ correctly, so it exercises the full build -> disk -> fresh process -> load
 close to zero; replace the logic, but keep the same
 persist-in-build / reconstruct-in-load shape.
 """
-import json
-import os
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
+from submission import bm25, boolean_vsm
 from submission.corpus_utils import load_corpus
-
-# TODO(you): once implemented, import and use your real scorers, e.g.:
-# from submission import bm25, boolean_vsm, custom_scorer
-# from submission.indexer import InvertedIndex
+from submission.indexer import InvertedIndex
 
 # ---------------------------------------------------------------------------
-# Module-level state. load_index() populates this; retrieve() reads it.
-# build_index() runs in a SEPARATE process and cannot rely on this state
-# surviving into load_index()/retrieve() — anything needed at query time
-# must be written to index_dir in build_index() and read back in
-# load_index().
+# Module-level state. load_index() populates this (via bm25.build() /
+# boolean_vsm.build()); retrieve() reads it. build_index() runs in a
+# SEPARATE process and cannot rely on this state surviving into
+# load_index()/retrieve() — everything needed at query time is written to
+# index_dir in build_index() (via InvertedIndex.save()) and read back in
+# load_index() (via InvertedIndex.load()).
 # ---------------------------------------------------------------------------
-_DOC_ORDER: Optional[List[str]] = None  # [doc_id, ...] in the order build_index() saw them
-
-_DOC_ORDER_FILENAME = "doc_order.json"  # TODO(you): replace with your real index files
+_LOADED = False
 
 
 def build_index(corpus_path: str, index_dir: str) -> None:
-    """Load the corpus, build whatever index structures you need, and
-    write everything retrieve() will need into `index_dir`.
+    """Load the corpus, build the inverted index, and persist it to
+    `index_dir`.
 
     Runs once, in its own process, before load_index() ever runs. Heavy
     one-time work — tokenising the whole corpus, building postings lists,
     computing collection statistics — belongs here, not in retrieve(), so
-    it doesn't get charged against your per-query latency. Whatever you
-    don't write to `index_dir` here does not exist as far as load_index()
-    is concerned.
+    it doesn't get charged against your per-query latency.
     """
     corpus = load_corpus(corpus_path)
-
-    # TODO(you): build your real inverted index / term statistics here, e.g.:
-    #
-    #   from submission.indexer import InvertedIndex
-    #   index = InvertedIndex()
-    #   index.build(corpus)
-    #   index.save(index_dir)          # <- persist it (see indexer.py)
-    #
-    # The trivial baseline below only persists doc_id order, which is all
-    # `_baseline_retrieve` needs.
-    os.makedirs(index_dir, exist_ok=True)
-    doc_order = [doc_id for doc_id, _text in corpus]
-    with open(os.path.join(index_dir, _DOC_ORDER_FILENAME), "w", encoding="utf-8") as f:
-        json.dump(doc_order, f)
+    index = InvertedIndex()
+    index.build(corpus)
+    index.save(index_dir)
 
 
 def load_index(index_dir: str) -> None:
-    """Reconstruct everything retrieve() needs, reading only from
-    `index_dir`. Runs once, in a fresh process, before any retrieve()
-    calls — there is no leftover state from build_index() to rely on.
+    """Reconstruct the inverted index, reading only from `index_dir`, and
+    prepare the scorers. Runs once, in a fresh process, before any
+    retrieve() calls — there is no leftover state from build_index() to
+    rely on.
     """
-    global _DOC_ORDER
-
-    # TODO(you): load your real index here, e.g.:
-    #
-    #   from submission.indexer import InvertedIndex
-    #   index = InvertedIndex.load(index_dir)
-    #   bm25.build(index)
-    #   boolean_vsm.build(index)
-    #
-    # and store it in a module-level variable so retrieve() can use it.
-    path = os.path.join(index_dir, _DOC_ORDER_FILENAME)
-    with open(path, encoding="utf-8") as f:
-        _DOC_ORDER = json.load(f)
+    global _LOADED
+    index = InvertedIndex.load(index_dir)
+    bm25.build(index)
+    boolean_vsm.build(index)
+    _LOADED = True
 
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
-    """Return up to k (doc_id, score) pairs for `query`, best first."""
-    if _DOC_ORDER is None:
+    """Return up to k (doc_id, score) pairs for `query`, best first.
+
+    Uses BM25 as the primary scorer — it carries 70% + 10% of the
+    leaderboard weight (nDCG@10, MAP@10), and Boolean/VSM is graded
+    separately for correctness rather than being the competition entry.
+
+    k1/b below were chosen by a grid sweep (scripts/tune_bm25.py) over
+    the released dev topics/qrels, maximizing nDCG@10 — see
+    runs/bm25_sweep.csv for the full grid. Re-run the sweep and update
+    these if the corpus or dev topics change; a value tuned on one
+    corpus is not guaranteed to transfer to another.
+    """
+    if not _LOADED:
         raise RuntimeError(
             "retrieve() called before load_index(); the harness always "
             "calls build_index(corpus_path, index_dir) and then "
@@ -122,19 +108,4 @@ def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
             "manually, do the same."
         )
 
-    # TODO(you): replace this with a real scorer, e.g.:
-    #   return bm25.score(query, k, k1=1.2, b=0.75)
-    return _baseline_retrieve(query, k)
-
-
-# ---------------------------------------------------------------------------
-# Trivial reference baseline — DO NOT submit this as your final entry.
-# Ignores the query and returns the first k documents in the order
-# build_index() persisted them, with a dummy descending score. Enough to
-# exercise the full harness, including real disk persistence across a
-# fresh process; metrics against it will legitimately be close to zero.
-# ---------------------------------------------------------------------------
-def _baseline_retrieve(query: str, k: int) -> List[Tuple[str, float]]:
-    assert _DOC_ORDER is not None
-    top = _DOC_ORDER[:k]
-    return [(doc_id, float(len(top) - i)) for i, doc_id in enumerate(top)]
+    return bm25.score(query, k, k1=2.5, b=0.6)

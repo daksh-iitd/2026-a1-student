@@ -26,15 +26,25 @@ directly (smaller, relative to the class median, scores better), so a
 compact postings encoding is worth more here than in most course
 assignments — see the `save()` docstring for concrete starting points.
 """
+import json
+import os
 import re
 from typing import Dict, List, Tuple
 
+from submission.stemmer import normalize_tokens
+
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+_INDEX_FILENAME = "index.json"
 
 
 def tokenize(text: str) -> List[str]:
-    """Lowercase, alphanumeric-only tokenization."""
-    return _TOKEN_RE.findall(text.lower())
+    """Lowercase, alphanumeric tokenization, followed by English stopword
+    removal and Porter stemming (submission/stemmer.py) so that e.g.
+    "running"/"runs"/"runner" conflate to a shared term and common
+    function words ("the", "of", ...) don't pollute postings lists or
+    dilute TF-IDF/BM25 scores. Every scorer (BM25, Boolean/VSM) calls this
+    same function, so they all see an identical token stream."""
+    return normalize_tokens(_TOKEN_RE.findall(text.lower()))
 
 
 class InvertedIndex:
@@ -55,17 +65,30 @@ class InvertedIndex:
         """corpus: list of (doc_id, text) pairs, e.g. from
         submission.corpus_utils.load_corpus().
 
-        TODO(you): tokenize each document, populate self.postings,
-        self.doc_len, self.doc_text, self.N, and self.avg_doc_len.
+        Tokenizes each document, populates self.postings, self.doc_len,
+        self.N, and self.avg_doc_len. Raw document text is intentionally
+        not retained (self.doc_text stays empty) — BM25/VSM only need
+        term frequencies and length statistics, and keeping raw text
+        around would bloat the persisted index for no scoring benefit.
         """
-        raise NotImplementedError("Implement InvertedIndex.build() — see assignment Section 4.1.")
+        self.postings = {}
+        self.doc_len = {}
+        total_len = 0
+        for doc_id, text in corpus:
+            tokens = tokenize(text)
+            self.doc_len[doc_id] = len(tokens)
+            total_len += len(tokens)
+            tf_counts: Dict[str, int] = {}
+            for tok in tokens:
+                tf_counts[tok] = tf_counts.get(tok, 0) + 1
+            for term, tf in tf_counts.items():
+                self.postings.setdefault(term, {})[doc_id] = tf
+        self.N = len(corpus)
+        self.avg_doc_len = (total_len / self.N) if self.N else 0.0
 
     def document_frequency(self, term: str) -> int:
-        """Number of documents containing `term` at least once.
-
-        TODO(you): implement using self.postings.
-        """
-        raise NotImplementedError("Implement InvertedIndex.document_frequency().")
+        """Number of documents containing `term` at least once."""
+        return len(self.postings.get(term, {}))
 
     def save(self, index_dir: str) -> None:
         """Persist everything document_frequency() / your scorers need to
@@ -85,16 +108,65 @@ class InvertedIndex:
             store gaps instead of absolute ids) and varint/byte-pack them,
             instead of a naive JSON list of integers.
 
-        TODO(you): implement.
+        This implementation takes the middle option above: doc_ids are
+        assigned small integer ids (stored once, in a single `doc_ids`
+        array) instead of being repeated as strings in every posting, and
+        each postings list is sorted by integer doc id and gap-encoded
+        (store the delta from the previous doc id, not the absolute id) —
+        cheaper to JSON-encode than either the raw string-keyed dict or
+        absolute integer ids.
         """
-        raise NotImplementedError("Implement InvertedIndex.save() — see assignment Section 4.1.")
+        os.makedirs(index_dir, exist_ok=True)
+
+        doc_ids = sorted(self.doc_len.keys())
+        doc_id_to_int = {doc_id: i for i, doc_id in enumerate(doc_ids)}
+        doc_len_arr = [self.doc_len[doc_id] for doc_id in doc_ids]
+
+        postings_compact: Dict[str, List[int]] = {}
+        for term, doc_tf in self.postings.items():
+            int_ids = sorted(doc_id_to_int[doc_id] for doc_id in doc_tf)
+            flat: List[int] = []
+            prev = 0
+            for int_id in int_ids:
+                doc_id = doc_ids[int_id]
+                flat.append(int_id - prev)
+                flat.append(doc_tf[doc_id])
+                prev = int_id
+            postings_compact[term] = flat
+
+        payload = {
+            "N": self.N,
+            "avg_doc_len": self.avg_doc_len,
+            "doc_ids": doc_ids,
+            "doc_len": doc_len_arr,
+            "postings": postings_compact,
+        }
+        with open(os.path.join(index_dir, _INDEX_FILENAME), "w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"))
 
     @classmethod
     def load(cls, index_dir: str) -> "InvertedIndex":
         """Reconstruct an InvertedIndex purely from what save() wrote to
         `index_dir`. Called in a fresh process — do not rely on any state
-        other than what's actually on disk in `index_dir`.
+        other than what's actually on disk in `index_dir`."""
+        with open(os.path.join(index_dir, _INDEX_FILENAME), encoding="utf-8") as f:
+            payload = json.load(f)
 
-        TODO(you): implement, matching whatever format save() wrote.
-        """
-        raise NotImplementedError("Implement InvertedIndex.load() — see assignment Section 4.1.")
+        index = cls()
+        index.N = payload["N"]
+        index.avg_doc_len = payload["avg_doc_len"]
+        doc_ids: List[str] = payload["doc_ids"]
+        doc_len_arr: List[int] = payload["doc_len"]
+        index.doc_len = dict(zip(doc_ids, doc_len_arr))
+
+        index.postings = {}
+        for term, flat in payload["postings"].items():
+            doc_tf: Dict[str, int] = {}
+            int_id = 0
+            for i in range(0, len(flat), 2):
+                int_id += flat[i]
+                tf = flat[i + 1]
+                doc_tf[doc_ids[int_id]] = tf
+            index.postings[term] = doc_tf
+
+        return index
