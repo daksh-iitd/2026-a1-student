@@ -56,11 +56,28 @@ def build(index: InvertedIndex) -> None:
         _IDF[term] = math.log((N - df + 0.5) / (df + 0.5) + 1)
 
 
-def score(query: str, k: int, k1: float = 1.2, b: float = 0.75) -> List[Tuple[str, float]]:
-    """Return up to k (doc_id, score) pairs for `query`, BM25-ranked,
-    highest score first."""
+def raw_scores(query: str, k1: float = 1.2, b: float = 0.75, delta: float = 0.0) -> Dict[str, float]:
+    """Every matched doc_id's BM25(+) score for `query`, unsorted.
+
+    Factored out of score() so callers that need to combine this with
+    another ranker (submission/custom_scorer.py's BM25+/VSM blend) can
+    skip the sort-then-slice step entirely and do exactly one sort over
+    the combined result, instead of one sort here that's immediately
+    thrown away plus a second sort over the union. Profiling
+    custom_scorer.score() on the full corpus showed this redundant sort
+    was ~80ms/query of pure overhead — see scripts/tune_bm25_vsm_blend.py
+    and report.tex's "Improving Query Latency" section.
+
+    `delta` (default 0.0, i.e. plain BM25) switches this to BM25+ (Lv &
+    Zhai, 2011, "Lower-Bounding Term Frequency Normalization"): adds a
+    small constant to every matched term's contribution, so a term's
+    presence in a long document is never driven arbitrarily close to
+    zero purely by length normalization — standard BM25's saturation
+    curve can otherwise under-reward long relevant documents relative to
+    short ones containing the same term once. See
+    scripts/tune_bm25_plus.py for the delta sweep."""
     if _INDEX is None:
-        raise RuntimeError("bm25.build() must be called before bm25.score().")
+        raise RuntimeError("bm25.build() must be called before bm25.raw_scores()/score().")
 
     avgdl = _INDEX.avg_doc_len or 1.0
     scores: Dict[str, float] = {}
@@ -72,7 +89,13 @@ def score(query: str, k: int, k1: float = 1.2, b: float = 0.75) -> List[Tuple[st
         for doc_id, tf in postings.items():
             dl = _INDEX.doc_len.get(doc_id, 0)
             denom = tf + k1 * (1 - b + b * dl / avgdl)
-            scores[doc_id] = scores.get(doc_id, 0.0) + idf * (tf * (k1 + 1)) / denom
+            scores[doc_id] = scores.get(doc_id, 0.0) + idf * ((tf * (k1 + 1)) / denom + delta)
+    return scores
 
+
+def score(query: str, k: int, k1: float = 1.2, b: float = 0.75, delta: float = 0.0) -> List[Tuple[str, float]]:
+    """Return up to k (doc_id, score) pairs for `query`, BM25-ranked,
+    highest score first. See raw_scores() for the delta/BM25+ explanation."""
+    scores = raw_scores(query, k1=k1, b=b, delta=delta)
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     return ranked[:k]

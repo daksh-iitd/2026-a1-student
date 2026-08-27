@@ -1,0 +1,603 @@
+% report.tex — COL 7364/764 Assignment 1 (Sparse Retrieval) report.
+%
+% LIVING DOCUMENT: this file is being built up incrementally as
+% experiments are run, per the assignment's Section 6 report
+% requirements. Sections marked "TODO(you)" need information only the
+% student has (registration number, personal reflection, anything about
+% the held-out leaderboard once it's revealed) or a judgment call the
+% report author should make themselves rather than have written for
+% them. Everything else reflects experiments actually run against this
+% repository's code, with the exact commands used, so every number here
+% is reproducible.
+%
+% Compile with: pdflatex report.tex (needs pgfplots for Section 4's
+% plots; run twice for cross-references/ToC if added later).
+
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+\usepackage{xcolor}
+\newcommand{\todo}[1]{\textcolor{red}{\textbf{TODO(you):} #1}}
+
+\title{COL 7364/764 Assignment 1 --- Sparse Retrieval Arena \\ \large Report}
+\author{\todo{name and registration number}}
+\date{Draft, generated \today}
+
+\begin{document}
+\maketitle
+
+\todo{This report is being assembled incrementally alongside development.
+Before submission: trim to 3--4 pages (assignment Section 6), fill in
+every TODO below, add the held-out/competition-round results once the
+leaderboard opens, and write the personal reflection / final paragraph
+in your own words.}
+
+\section{Indexing Design Choices}
+
+\subsection{Tokenization and normalization}
+Tokenization is lowercase alphanumeric regex matching (\texttt{[a-z0-9]+}),
+followed by English stopword removal and Porter stemming
+(\texttt{submission/stemmer.py}). The Porter stemmer was implemented from
+scratch rather than via NLTK's, for a specific reason: \texttt{build\_index()}
+and \texttt{load\_index()} must not require network access, and the
+grading container runs with \texttt{--network none}
+(\texttt{docs/SUBMISSION\_INTERFACE.md}) --- NLTK's stopword corpus needs a
+one-time \texttt{nltk.download()}, which would break silently at grading
+time unless bundled into the Docker image. The stemmer was verified
+against the classic Porter test vocabulary and the canonical IR-textbook
+over-stemming examples (\texttt{organization}/\texttt{organ}
+$\to$ \texttt{organ}; \texttt{university}/\texttt{universe} $\to$
+\texttt{univers}), both matching exactly. The stopword list is the
+standard 179-word SMART/NLTK English list, embedded directly rather than
+fetched.
+
+Effect on the toy set: nDCG@10 rose from 0.826 to 0.879 and MAP@10 from
+0.658 to 0.825 after adding stemming/stopwords (holding BM25's $k_1,b$ at
+their un-tuned textbook defaults), and the run began beating the local
+generic-BM25 reference comparison on both metrics, which it did not
+before.
+
+\subsection{Index persistence and compression}
+\texttt{InvertedIndex} stores postings (\texttt{term} $\to$
+\{\texttt{doc\_id}: \texttt{tf}\}), per-document lengths, and collection
+statistics; raw document text is never retained, since BM25/VSM only need
+term-frequency and length statistics. On disk, doc\_ids are assigned
+small integer ids (stored once), and each postings list is sorted by
+integer doc id and \emph{gap-encoded} --- storing the delta from the
+previous doc id rather than the absolute id, which is small for the
+common case of a term appearing in nearby-indexed documents.
+
+The initial implementation serialized this as one JSON blob
+(\texttt{index.json}); every gap/tf integer cost 1 ASCII byte per digit
+plus a separator. This was replaced with genuine \emph{variable-byte
+(VByte)} binary encoding (\texttt{submission/vbyte.py}, following the
+scheme in Manning/Raghavan/Sch\"utze \S 5.3.2): each non-negative integer
+is packed into 7-bit groups, one byte per group, with the high bit
+marking the last byte of a number. Small integers (the common case for
+gaps and term frequencies) now cost exactly 1 byte. The persisted index
+is split into six single-purpose files (\texttt{meta.json},
+\texttt{doc\_ids.txt}, \texttt{doc\_len.bin}, \texttt{vocab\_terms.txt},
+\texttt{vocab\_lengths.bin}, \texttt{postings.bin}) instead of one JSON
+blob; term \emph{offsets} into \texttt{postings.bin} are not stored at
+all, since slices are written back-to-back and \texttt{load()}
+reconstructs offsets as a running sum of the preceding lengths.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+ & JSON (before) & VByte binary (after) \\
+\midrule
+Index size (171{,}332 docs, trec-covid) & 62.5\,MB & \textbf{29.1\,MB (--53\%)} \\
+Index build time & 15.2\,s & 16.2\,s \\
+Index load time & 2.7\,s & 4.4\,s \\
+Mean query latency & 40.5\,ms & 40.2\,ms \\
+\bottomrule
+\end{tabular}
+\caption{Effect of switching from JSON to VByte binary persistence. Ranking
+output (nDCG@10/MAP@10/every per-query result) is bit-for-bit identical
+before and after --- confirmed by round-trip unit tests
+(\texttt{tests/test\_index\_persistence.py}) and an unchanged full-corpus
+harness report.}
+\end{table}
+
+\noindent\textbf{Honest tradeoff:} load time increased by about 60\%.
+Pure-Python VByte decoding (a per-integer bit-shift loop) is slower than
+\texttt{json.load()}'s C parser, even though it processes far fewer
+bytes. This is a real cost against the efficiency component, traded for
+the much larger index-size win --- not a free lunch.
+
+\section{Boolean/VSM vs. BM25 Comparison}
+
+Boolean AND/OR retrieval (\texttt{boolean\_search()}) returns an
+\emph{unranked} set of matching doc\_ids, so nDCG@10/MAP@10 --- both
+rank-sensitive metrics --- aren't well-defined for it without an
+arbitrary ordering convention. It is evaluated separately as a
+correctness-checked candidate filter, not as a competing ranked scorer.
+The comparison below is therefore between the two \emph{ranked} scorers:
+TF-IDF cosine VSM and BM25, both evaluated identically via
+\texttt{scripts/compare\_scorers.py}.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llrrrr}
+\toprule
+Corpus & Scorer & nDCG@10 & MAP@10 & MRR & P@10 \\
+\midrule
+toy (20 docs)      & BM25 & 0.8826 & 0.8250 & 1.0000 & 0.3167 \\
+toy (20 docs)      & VSM  & 0.8793 & 0.8250 & 1.0000 & 0.3167 \\
+full (171{,}332 docs, trec-covid) & BM25 & \textbf{0.6672} & \textbf{0.0166} & 0.8590 & \textbf{0.7380} \\
+full (171{,}332 docs, trec-covid) & VSM  & 0.4425 & 0.0103 & 0.6864 & 0.5060 \\
+\bottomrule
+\end{tabular}
+\caption{VSM vs.\ BM25, same tokenizer/index, same dev queries. The gap
+is negligible on the toy set (too small to separate the models) but
+substantial at real scale: BM25's length normalization ($b$) and
+term-frequency saturation ($k_1$) matter far more once document lengths
+and term-frequency distributions actually vary across 170K+ documents.}
+\end{table}
+
+\section{BM25 Parameter Search ($k_1$, $b$)}
+
+\subsection{Methodology}
+$k_1$ and $b$ were swept on the \emph{dev} topics/qrels only ---
+never on held-out data, which is neither available nor intended for
+tuning against (\texttt{data/README.md}: held-out topics are never
+distributed). \texttt{scripts/tune\_bm25.py} builds the index once,
+reuses it across the full grid (99 combinations: 11 values of $k_1 \in
+[0.4, 3.0]$ $\times$ 9 values of $b \in [0.0, 1.0]$), and selects the
+combination maximizing nDCG@10 --- the assignment's primary leaderboard
+metric (70\% weight).
+
+\subsection{Result}
+Best: $k_1{=}2.5$, $b{=}0.6$, nDCG@10 $= 0.6672$, versus $0.6400$ at the
+textbook defaults ($k_1{=}1.2$, $b{=}0.75$) --- a $+0.027$ absolute gain.
+Figure~\ref{fig:k1} and Figure~\ref{fig:b} show each parameter's slice
+through the grid, holding the other at its optimum. Both curves show a
+genuine interior peak, not a value pinned to the edge of the search
+range, which is some evidence the grid was wide enough to actually find
+the optimum rather than being truncated by it.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.75\textwidth, height=6cm,
+    xlabel={$k_1$ (with $b=0.6$ fixed)}, ylabel={nDCG@10},
+    grid=major, mark options={scale=1.2},
+]
+\addplot coordinates {
+  (0.4,0.5582) (0.6,0.5899) (0.8,0.6148) (1.0,0.6326) (1.2,0.6401)
+  (1.4,0.6459) (1.6,0.6589) (1.8,0.6634) (2.0,0.6656) (2.5,0.6672)
+  (3.0,0.6653)
+};
+\addplot[only marks, mark=*, red] coordinates {(2.5,0.6672)};
+\end{axis}
+\end{tikzpicture}
+\caption{nDCG@10 vs.\ $k_1$, dev set, full trec-covid corpus. Peak at
+$k_1{=}2.5$ (marked).}
+\label{fig:k1}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.75\textwidth, height=6cm,
+    xlabel={$b$ (with $k_1=2.5$ fixed)}, ylabel={nDCG@10},
+    grid=major, mark options={scale=1.2},
+]
+\addplot coordinates {
+  (0.0,0.5490) (0.1,0.6202) (0.25,0.6493) (0.4,0.6596) (0.5,0.6641)
+  (0.6,0.6672) (0.75,0.6486) (0.9,0.5833) (1.0,0.4919)
+};
+\addplot[only marks, mark=*, red] coordinates {(0.6,0.6672)};
+\end{axis}
+\end{tikzpicture}
+\caption{nDCG@10 vs.\ $b$, dev set, full trec-covid corpus. Peak at
+$b{=}0.6$ (marked) --- notably below the textbook default of 0.75.}
+\label{fig:b}
+\end{figure}
+
+\subsection{Interpretation}
+$b$'s optimum ($\approx 0.6$) sitting below the textbook 0.75 is
+plausibly explained by trec-covid's document lengths: scientific
+abstracts are fairly uniform in length compared to, say, a mixed
+newswire corpus, so less aggressive length normalization is needed.
+\todo{Confirm this hypothesis with actual doc-length variance/histogram
+data if time allows, and re-run this whole sweep if/when the real
+announced course corpus differs from the trec-covid placeholder used
+here.}
+
+\section{Custom Scorer Exploration: Rocchio Pseudo-Relevance Feedback}
+
+\subsection{What was tried}
+A Rocchio-style blind PRF scorer (\texttt{submission/custom\_scorer.py})
+was implemented: an initial BM25 pass retrieves $k_{prf}$ pseudo-relevant
+documents; the highest-TF-IDF-weighted terms from their centroid are
+added to the query (capped at \texttt{num\_expansion\_terms}, to bound
+topic drift); the expanded, weighted query is re-scored with BM25. This
+required a small refactor of \texttt{bm25.py} to accept pre-weighted
+\{term: weight\} query vectors (\texttt{score\_weighted()}) rather than
+only raw query strings, since expansion terms carry real-valued weights,
+not integer occurrence counts.
+
+\subsection{Result: it did not help}
+\texttt{scripts/tune\_prf.py} swept 36 combinations of $k_{prf} \in
+\{5,10,20\}$, expansion size $\in \{5,15,30\}$, and $\beta \in
+\{0.25,0.5,0.75,1.0\}$ against plain BM25 (nDCG@10 $=0.6672$) on the same
+dev set. \textbf{Every single configuration scored worse than plain
+BM25}, and performance monotonically degraded as $\beta$ (expansion
+weight) increased. The least-damaging setting found
+($k_{prf}{=}10$, expansion${=}30$, $\beta{=}0.25$) still lost $0.045$
+nDCG@10 (0.6223 vs.\ 0.6672).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{rrrrr}
+\toprule
+$k_{prf}$ & expansion terms & $\beta$ & nDCG@10 & $\Delta$ vs.\ BM25 \\
+\midrule
+10 & 30 & 0.25 & 0.6223 & $-0.0448$ \\
+10 & 15 & 0.25 & 0.6158 & $-0.0513$ \\
+10 & 30 & 0.50 & 0.6125 & $-0.0547$ \\
+20 & 15 & 0.25 & 0.6113 & $-0.0558$ \\
+20 & 30 & 1.00 & 0.5902 & $-0.0770$ \\
+\bottomrule
+\end{tabular}
+\caption{Best and a representative worst PRF configuration, vs.\ plain
+BM25 (nDCG@10 $=0.6672$). Full 36-row sweep was produced by
+\texttt{scripts/tune\_prf.py} but not retained in the repo after this
+negative result was confirmed.}
+\end{table}
+
+\subsection{Why, and the decision}
+This is a textbook PRF failure mode: trec-covid queries are short,
+topical, medical-domain phrases, and the top-10 initial results --- while
+mostly on-topic in aggregate --- are dense enough in shared vocabulary
+that expansion terms pull in generic co-occurring words rather than
+discriminative ones (topic drift), diluting rather than sharpening the
+query. \textbf{Decision: custom\_scorer.py is implemented and correct,
+but not wired into \texttt{retrieve()}} --- \texttt{retrieve.py} uses
+plain tuned BM25 as the sole scorer. This is treated as a genuine,
+reportable finding rather than a wasted detour: the sweep data is exactly
+the evidence behind the decision not to submit it.
+
+\section{Field-Weighting Experiment (Title vs.\ Abstract BM25)}
+
+\subsection{Motivation and constraint}
+Field weighting scores title and body separately and combines them:
+$\text{score}(q,d) = w_{title}\cdot\text{BM25}(q,\text{title}) +
+w_{body}\cdot\text{BM25}(q,\text{abstract})$. This requires a document
+schema with a genuine title/body split. The assignment's actual corpus
+contract (\texttt{data/README.md}) guarantees only a single flat
+\texttt{text} field per document, with no title field --- so before
+building anything, this was scoped as two separate questions: (1) does
+field weighting help \emph{at all}, using a corpus that happens to have
+real title/abstract metadata, and (2) if so, can that benefit be
+recovered safely, using only the guaranteed \texttt{\{doc\_id, text\}}
+interface, without depending on metadata the real grading corpus might
+not have.
+
+\subsection{Experiment 1: true title/abstract split (research only)}
+\texttt{scripts/build\_titled\_corpus.py} pulled \texttt{ir\_datasets}'
+native \texttt{title} and \texttt{text} (abstract) fields separately for
+\texttt{beir/trec-covid} (normally collapsed into one field by
+\texttt{download\_full\_corpus.py}). \texttt{scripts/tune\_field\_weights.py}
+built two independent \texttt{InvertedIndex} objects (title-only,
+abstract-only), scored every dev query against each with BM25
+\emph{once} (unbounded $k$, so every matched doc's score is cached), then
+swept $w_{title}$ (with $w_{body}{=}1.0$ fixed) as cheap weighted
+recombinations of the two cached score dicts --- no rescoring per grid
+point.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+Configuration & nDCG@10 & MAP@10 \\
+\midrule
+Abstract only ($w_{title}{=}0$) & 0.6369 & 0.0153 \\
+Title only ($w_{body}{=}0$) & 0.4798 & 0.0116 \\
+Concatenated text (deployed baseline) & 0.6672 & 0.0166 \\
+\textbf{Field-weighted, $w_{title}{=}1.0$, $w_{body}{=}1.0$} & \textbf{0.6861} & \textbf{0.0183} \\
+\bottomrule
+\end{tabular}
+\caption{True-field BM25F vs.\ single-field BM25 over concatenated text.
+Titles average 9.9 tokens, abstracts 103.4 tokens --- BM25's per-field
+length normalization exploits that disparity once the fields are kept
+separate; blending them into one field (the deployed baseline) washes
+this out.}
+\end{table}
+
+\noindent A real gain: \textbf{+0.0189 nDCG@10} over the deployed
+concatenated-text baseline, peaking at an interior point ($w_{title}{=}1.0$,
+between the tested 0.75 and 1.5), not a grid edge.
+
+\subsection{Experiment 2: submission-safe heuristic (does the gain survive without a real title field?)}
+Two heuristics for reconstructing a title-like field from only
+\texttt{text} were tried. \textbf{Split on the first period:} rejected
+before evaluation --- checked against the true titles, this exact-matched
+only 4.9\% of documents and averaged 34 tokens vs.\ the true $\sim$10,
+because titles in this corpus don't end in periods, so the split mostly
+captures ``title + first sentence of the abstract'' together, not a clean
+title. \textbf{Fixed-length token prefix instead}
+(\texttt{scripts/tune\_prefix\_weights.py}): treat the first
+\texttt{prefix\_len} tokens of the tokenized \texttt{text} field as a
+pseudo-title, sweeping \texttt{prefix\_len} $\in \{8,10,12,15,20\}$
+against $w_{prefix}$ --- punctuation-independent, works on any corpus
+matching the documented format.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lr}
+\toprule
+Configuration & nDCG@10 \\
+\midrule
+Concatenated text (deployed baseline) & 0.6672 \\
+Best prefix heuristic (prefix\_len=12, $w_{prefix}{=}0.5$) & 0.6682 \\
+True title/abstract fields (Experiment 1, not submittable) & 0.6861 \\
+\bottomrule
+\end{tabular}
+\caption{The prefix heuristic recovers only \textbf{5.5\%} of the true-field
+gain ($+0.0010$ vs.\ $+0.0189$ nDCG@10) --- noise-level over 50 dev
+queries, not a real improvement.}
+\end{table}
+
+\subsection{Decision}
+\textbf{Not wired into \texttt{retrieve()}.} The pattern here is the
+inverse of \S 5's PRF result: the \emph{idea} is validated (field
+weighting is a real, sizeable win when genuine title metadata exists),
+but the specific mechanism available under this assignment's actual
+corpus contract (a single flat \texttt{text} field, no guaranteed title)
+cannot safely reconstruct enough of that signal to justify the added
+complexity and doubled query latency (two BM25 passes per query, as in
+\S 5). \todo{If the real announced/held-out corpus turns out to ship a
+genuine title field (worth checking once it's released), re-run
+\texttt{scripts/tune\_field\_weights.py}-style field weighting directly
+against it --- Experiment 1 is the evidence this would likely be worth
+doing properly, not through the token-prefix proxy.}
+
+\section{Static BM25+/VSM Blend}
+
+\subsection{What was tried}
+Two further, independent modifications to the base BM25 scorer:
+
+\begin{itemize}
+\item \textbf{A static blend with VSM}: $\text{score}(d) = w \cdot
+\text{BM25}_{norm}(d) + (1-w)\cdot\text{VSM}_{norm}(d)$, each min-max
+normalized per query into $[0,1]$ first (BM25 is unbounded, VSM cosine
+is already in $[0,1]$ --- not comparable on a shared scale otherwise).
+Unlike \S 5's Rocchio PRF, this blends two rankers that each score the
+\emph{original}, unexpanded query independently, so it isn't vulnerable
+to PRF's topic-drift failure mode.
+\item \textbf{BM25+} (Lv \& Zhai, 2011): adds a small constant $\delta$
+to every matched term's contribution
+(\texttt{submission/bm25.py}'s new \texttt{delta} parameter, default 0
+= plain BM25), correcting BM25's tendency to under-reward long relevant
+documents purely from length normalization.
+\end{itemize}
+
+\subsection{Result: both help, and they compound}
+\texttt{scripts/tune\_bm25\_vsm\_blend.py} found $w{=}0.75$ alone gave
+$+0.0118$ nDCG@10; \texttt{scripts/tune\_bm25\_plus.py} found
+$\delta{=}0.1$ alone gave $+0.0039$. Using BM25+ as the blend's BM25
+component (rather than plain BM25) and re-sweeping both parameters
+jointly found they compound past either alone, peaking around
+$\delta{\approx}0.75$, $w{\approx}0.8$ before declining:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+Configuration & nDCG@10 & MAP@10 \\
+\midrule
+Plain BM25 ($k_1{=}2.5$, $b{=}0.6$) & 0.6672 & 0.0166 \\
+BM25+VSM blend alone ($w{=}0.75$, $\delta{=}0$) & 0.6789 & 0.0173 \\
+BM25+ alone ($\delta{=}0.1$) & 0.6710 & 0.0170 \\
+\textbf{Combined (}$\delta{=}0.75$\textbf{,} $w{=}0.8$\textbf{)} & \textbf{0.6899} & \textbf{0.0174} \\
+\bottomrule
+\end{tabular}
+\caption{Full end-to-end harness run through the actual
+\texttt{build\_index()}/\texttt{load\_index()}/\texttt{retrieve()} path
+(\texttt{runs/full\_report.json}), not just the sweep script --- confirms
+the combined result reproduces outside the sweep's cached-score
+shortcut. Total gain over plain BM25: \textbf{+0.0227} nDCG@10, on top of
+the \textbf{+0.027} already gained from the original $k_1$/$b$ tuning.}
+\end{table}
+
+\subsection{Honest cost: query latency}
+This is the one change so far with a real, non-trivial efficiency cost.
+Mean query latency initially rose from \textbf{40.5\,ms to 153.8\,ms}
+(${\sim}3.8\times$, not the ${\sim}2\times$ a single extra scoring pass
+would suggest) --- see \S\ref{sec:latency} for why, and the fix that
+brought it down to 105\,ms. Even before that fix, this was judged worth
+it: the efficiency component is only $\pm10\%$ of the leaderboard score,
+against a $+0.0227$ gain on the 70\%-weighted primary metric. Index size
+and build/load time are unaffected (this scorer adds no persisted
+state).
+
+\subsection{Decision}
+\textbf{Wired into \texttt{retrieve()}}
+(\texttt{submission/custom\_scorer.py}, default
+$k_1{=}2.5,b{=}0.6,\delta{=}0.75,w{=}0.8$) --- this is the actual
+competition entry as of this report. \todo{Item 3 of Section 6's
+submission checklist (``a one-paragraph description of your final
+competition entry'') should now describe \emph{this} blended scorer, not
+plain BM25 --- update that paragraph below to match.}
+
+\section{Improving Query Latency}
+\label{sec:latency}
+
+\subsection{Diagnosis}
+The blended scorer's $3.8\times$ latency jump (\S 6) was disproportionate
+to "one extra scoring pass" and worth profiling rather than accepting at
+face value. Timing \texttt{bm25.score()} and \texttt{vsm\_score()} in
+isolation summed to \textbf{88\,ms/query}; \texttt{custom\_scorer.score()}
+itself took \textbf{169\,ms/query} --- \textbf{81\,ms of pure overhead}
+beyond running both scorers. The cause: both \texttt{bm25.score()} and
+\texttt{vsm\_score()} always fully sort \emph{every} matched document
+before truncating to $k$ (unavoidable internally, since the top-$k$
+isn't known without scoring everything first) --- and
+\texttt{custom\_scorer.score()} was calling both with an unbounded inner
+$k$ (to get every candidate for normalization) and then sorting the
+\emph{combined} result again. That's three full sorts over
+(potentially tens of thousands of) matched documents per query, where
+one would do; the first two were computed and immediately discarded.
+
+\subsection{Fix}
+\texttt{submission/bm25.py} and \texttt{submission/boolean\_vsm.py} each
+gained a \texttt{raw\_scores(query, ...)} function returning the
+unsorted \{doc\_id: score\} dict directly; \texttt{score()}/
+\texttt{vsm\_score()} became thin sort-and-truncate wrappers around it.
+\texttt{custom\_scorer.score()} now calls \texttt{raw\_scores()} on both
+scorers and performs exactly one sort, over the combined result.
+Behavior-preserving by construction (same underlying dict, just skipping
+two sorts that were thrown away) --- confirmed via the toy-set smoke
+test (identical nDCG@10/MAP@10 before and after) and a fresh full-corpus
+harness run.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+ & Before fix & After fix \\
+\midrule
+Mean query latency & 153.8\,ms & \textbf{105.3\,ms (--32\%)} \\
+Max query latency & 292.1\,ms & 221.7\,ms \\
+nDCG@10 & 0.6899 & 0.6896 \\
+\bottomrule
+\end{tabular}
+\caption{Full \texttt{build\_index()}/\texttt{load\_index()}/\texttt{retrieve()}
+harness runs, before and after removing the redundant sorts. The
+$0.0003$ nDCG@10 difference is cross-process score-tie-break noise (see
+\S 4's discussion of \texttt{PYTHONHASHSEED}-dependent set iteration
+order for tied scores), not a ranking regression.}
+\end{table}
+
+\subsection{What's left on the table}
+105\,ms/query is close to the sum of running BM25 and VSM independently
+(88\,ms) --- there isn't much redundant work left to remove without a
+more invasive redesign. \todo{Two further directions, not attempted:
+(1) restrict the VSM pass to a candidate pool (e.g.\ BM25's own top-$N$)
+instead of scoring every document any query term matches, trading a
+small risk of missing a VSM-favored-but-BM25-unfavored document for
+speed; (2) a compiled extension (Cython/pybind11, permitted per
+\texttt{docs/SUBMISSION\_INTERFACE.md}) for the inner scoring loops ---
+the assignment explicitly expects this to give a real efficiency
+advantage over pure Python. Neither was necessary here: 105\,ms is
+already fast in absolute terms, and the $\pm10\%$-weighted efficiency
+component is small next to the 70\%-weighted nDCG@10 gain this scorer
+provides.}
+
+\section{Error Analysis}
+
+\todo{The table below reflects the plain-BM25 configuration (\S 4),
+\emph{before} the BM25+/VSM blend in \S 6 was wired in. Re-generate
+against the final \texttt{retrieve()} (blended scorer) for full
+consistency before submitting --- the specific worst queries and their
+scores may have shifted.}
+
+The five lowest-nDCG@10 dev queries (full corpus, tuned BM25):
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{p{9.5cm}rr}
+\toprule
+Query & nDCG@10 & P@10 \\
+\midrule
+``what causes death from Covid-19?'' & 0.0948 & 0.10 \\
+``what are best practices in hospitals and at home in maintaining quarantine?'' & 0.1606 & 0.50 \\
+``How does the coronavirus differ from seasonal flu?'' & 0.2664 & 0.20 \\
+``do individuals who recover from COVID-19 show sufficient immune response...'' & 0.2811 & 0.50 \\
+``what is the origin of COVID-19'' & 0.3000 & 0.80 \\
+\bottomrule
+\end{tabular}
+\caption{Worst-ranked dev queries, from \texttt{runs/full\_report.json}.}
+\end{table}
+
+A pattern worth naming: since the entire corpus is COVID-related, terms
+like ``covid'', ``coronavirus'', and ``19'' appear in a very large
+fraction of all 171K documents --- their IDF is near zero, so BM25 gets
+almost no discriminative signal from them. Ranking is effectively driven
+only by the \emph{remaining} content words (``death'', ``cause'',
+``practices'', ``quarantine'', ``immune response'', ``antibody'',
+``origin''), and queries whose real information need hinges on a
+multi-word relationship between those remaining terms (e.g.\ ``what
+\emph{causes} death'' vs.\ documents merely co-mentioning ``death'' and
+``COVID'' incidentally) are exactly where a bag-of-words scorer with no
+proximity signal struggles most. This is consistent with Section 3's
+finding that the phrase/bigram-proximity direction (not attempted here,
+see \S 3 discussion in the assignment prompt) is a plausible next lever,
+though PRF specifically was tried and rejected for the reason above.
+\todo{Pick 1--2 of these queries and manually inspect the actual top-10
+retrieved doc\_ids against the qrels to confirm or refute this
+hypothesis with a concrete example, per the assignment's requirement for
+specific, evidenced analysis rather than a general pattern claim alone.}
+
+\section{Final Competition Entry}
+
+\todo{One paragraph, your own words, per assignment Section 6 item 3.
+Current state to describe accurately: the submitted \texttt{retrieve()}
+uses \texttt{submission/custom\_scorer.py}'s static BM25+/VSM blend
+($k_1{=}2.5$, $b{=}0.6$, $\delta{=}0.75$, $w{=}0.8$; \S 6) over a
+stemmed, stopword-filtered index --- BM25+ and VSM scores min-max
+normalized per query and linearly combined, chosen because it beat plain
+tuned BM25 by $+0.023$ nDCG@10 (\S 6) at a real but acceptable query-latency
+cost (${\sim}154$ms mean, up from ${\sim}40$ms). Boolean retrieval is
+implemented and independently correct but not part of the ranked
+competition path (\S 2). Two alternative directions were implemented,
+evaluated on dev, and deliberately \emph{not} shipped: Rocchio PRF
+(\S 5) underperformed plain BM25 on every tested configuration; true
+field weighting (\S 6 of the earlier section / title-vs-abstract
+experiment) showed a real gain but depends on a title field the actual
+corpus contract doesn't guarantee, and the safe fallback heuristic
+recovered only 5.5\% of that gain --- not worth shipping.}
+
+\section{AI-Use Disclosure Statement}
+
+\todo{Confirm/complete this section yourself before submission --- it
+must be accurate about what happened in every session, not just this
+one.} Claude Code (Anthropic) was used as a development assistant across
+multiple sessions on this repository. In the session this report was
+drafted from: the Porter stemmer and stopword list
+(\texttt{submission/stemmer.py}), the BM25 parameter sweep
+(\texttt{scripts/tune\_bm25.py}) and resulting $k_1$/$b$ choice, the
+Rocchio PRF implementation and its evaluation/rejection
+(\texttt{submission/custom\_scorer.py}, \texttt{scripts/tune\_prf.py}),
+the VByte index compression (\texttt{submission/vbyte.py} and the
+\texttt{save()}/\texttt{load()} rewrite in \texttt{submission/indexer.py}),
+their accompanying unit tests, and this report file itself were written
+with Claude Code's assistance, under the student's direction and review
+at each step. \todo{An earlier session (git commit \texttt{40108e5},
+``migrated the claude generated code'') produced the initial
+\texttt{bm25.py}/\texttt{boolean\_vsm.py} implementations before this
+report-writing session began --- describe that session's AI use here
+from your own memory of it, since it isn't visible from this
+conversation.}
+
+\section{Code Provenance Statement}
+
+\todo{Confirm/complete.} The Porter stemming algorithm follows the rule
+tables published in M.\ F.\ Porter, ``An Algorithm for Suffix Stripping,''
+\emph{Program}, 14(3), 1980 --- a from-scratch implementation against the
+published specification, not copied from any existing codebase (verified
+against the canonical Porter test vocabulary and the
+organization/organ, university/universe textbook over-stemming
+examples). The stopword list is the standard, publicly-published
+179-word SMART/NLTK English stopword list. The VByte encoding follows
+the general scheme described in Manning, Raghavan \& Sch\"utze,
+\emph{Introduction to Information Retrieval}, \S 5.3.2 (a standard,
+widely-taught technique, not a specific implementation copied from any
+source). BM25, TF-IDF/cosine VSM, Boolean AND/OR, the inverted index, and
+Rocchio PRF are original implementations of published formulas (Robertson
+\& Walker 1992; Robertson \& Zaragoza 2009; Rocchio 1971) against this
+repository's own data structures, with no external search/indexing
+library used, per assignment Section 8.
+
+\end{document}

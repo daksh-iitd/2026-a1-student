@@ -90,11 +90,14 @@ def boolean_search(query: str, mode: str = "and") -> List[str]:
     return list(result)
 
 
-def vsm_score(query: str, k: int) -> List[Tuple[str, float]]:
-    """Return up to k (doc_id, score) pairs for `query`, ranked by
-    TF-IDF cosine similarity, highest score first."""
+def raw_scores(query: str) -> Dict[str, float]:
+    """Every matched doc_id's TF-IDF cosine similarity to `query`,
+    unsorted. Factored out of vsm_score() so callers combining this with
+    another ranker (submission/custom_scorer.py) can skip a sort that
+    would be immediately discarded — see bm25.raw_scores()'s docstring
+    for the profiling behind this."""
     if _INDEX is None:
-        raise RuntimeError("boolean_vsm.build() must be called before vsm_score().")
+        raise RuntimeError("boolean_vsm.build() must be called before boolean_vsm.raw_scores()/vsm_score().")
 
     q_tf: Dict[str, int] = {}
     for term in tokenize(query):
@@ -102,7 +105,7 @@ def vsm_score(query: str, k: int) -> List[Tuple[str, float]]:
     q_weights = {term: tf * _IDF.get(term, 0.0) for term, tf in q_tf.items()}
     q_norm = math.sqrt(sum(w * w for w in q_weights.values()))
     if q_norm == 0:
-        return []
+        return {}
 
     dot: Dict[str, float] = {}
     for term, qw in q_weights.items():
@@ -115,12 +118,18 @@ def vsm_score(query: str, k: int) -> List[Tuple[str, float]]:
         for doc_id, tf in postings.items():
             dot[doc_id] = dot.get(doc_id, 0.0) + qw * (tf * idf)
 
-    scored: List[Tuple[str, float]] = []
+    scores: Dict[str, float] = {}
     for doc_id, d in dot.items():
         dnorm = _DOC_NORMS.get(doc_id, 0.0)
         if dnorm == 0:
             continue
-        scored.append((doc_id, d / (dnorm * q_norm)))
+        scores[doc_id] = d / (dnorm * q_norm)
+    return scores
 
-    scored.sort(key=lambda item: item[1], reverse=True)
+
+def vsm_score(query: str, k: int) -> List[Tuple[str, float]]:
+    """Return up to k (doc_id, score) pairs for `query`, ranked by
+    TF-IDF cosine similarity, highest score first."""
+    scores = raw_scores(query)
+    scored = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     return scored[:k]

@@ -31,10 +31,10 @@ import os
 import re
 from typing import Dict, List, Tuple
 
+from submission import vbyte
 from submission.stemmer import normalize_tokens
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
-_INDEX_FILENAME = "index.json"
 
 
 def tokenize(text: str) -> List[str]:
@@ -98,74 +98,119 @@ class InvertedIndex:
 
         The on-disk byte size of whatever you write here is graded
         directly (assignment Section 7, "index size", relative to the
-        class median) — some starting points, roughly in order of effort:
-          - json/pickle-dump self.postings etc. directly (works, but
-            verbose: repeats every doc_id string per posting).
-          - drop self.doc_text if your scorers don't need raw text at
-            query time (BM25/VSM only need term-frequency and length
-            statistics, not the original documents).
-          - delta-encode each postings list's doc-ids (sorted ascending,
-            store gaps instead of absolute ids) and varint/byte-pack them,
-            instead of a naive JSON list of integers.
-
-        This implementation takes the middle option above: doc_ids are
-        assigned small integer ids (stored once, in a single `doc_ids`
-        array) instead of being repeated as strings in every posting, and
-        each postings list is sorted by integer doc id and gap-encoded
-        (store the delta from the previous doc id, not the absolute id) —
-        cheaper to JSON-encode than either the raw string-keyed dict or
-        absolute integer ids.
+        class median). This implementation takes the full path suggested
+        by the docstring this replaced: doc_ids are assigned small integer
+        ids (stored once), each postings list is sorted by integer doc id
+        and gap-encoded (store the delta from the previous doc id, not the
+        absolute id), and — the step that used to be missing — every
+        integer (gaps, term frequencies, doc lengths, per-term postings
+        byte-lengths) is VByte-encoded (submission/vbyte.py) into raw
+        binary instead of a JSON array of ASCII digits. A JSON int costs
+        1 separator byte plus 1 ASCII byte per digit; small VByte ints
+        (the common case for gaps and term frequencies) cost exactly 1
+        byte. Five files, each single-purpose so nothing forces text and
+        binary data to share one JSON blob:
+          - meta.json:          N, avg_doc_len, n_docs, n_terms (tiny; the
+                                 only real JSON left, because there's
+                                 nothing bulk here to save bytes on)
+          - doc_ids.txt:        doc_ids, newline-joined, in ascending
+                                 int-id order
+          - doc_len.bin:        VByte(doc_len[i]) for i in doc_ids order
+          - vocab_terms.txt:    postings' terms, newline-joined, sorted
+          - vocab_lengths.bin:  VByte(byte length of each term's slice in
+                                 postings.bin), same order as
+                                 vocab_terms.txt — a term's *offset* is
+                                 never stored: since every slice is
+                                 written back-to-back with no gaps,
+                                 load() reconstructs offsets as a running
+                                 sum of the preceding lengths
+          - postings.bin:       each term's (gap, tf) pairs, VByte-encoded
+                                 and concatenated in vocab_terms.txt order
         """
         os.makedirs(index_dir, exist_ok=True)
 
         doc_ids = sorted(self.doc_len.keys())
+        for doc_id in doc_ids:
+            if "\n" in doc_id:
+                raise ValueError(f"doc_id {doc_id!r} contains a newline; doc_ids.txt can't round-trip it")
         doc_id_to_int = {doc_id: i for i, doc_id in enumerate(doc_ids)}
         doc_len_arr = [self.doc_len[doc_id] for doc_id in doc_ids]
 
-        postings_compact: Dict[str, List[int]] = {}
-        for term, doc_tf in self.postings.items():
+        terms = sorted(self.postings.keys())
+        postings_blob = bytearray()
+        term_lengths: List[int] = []
+        for term in terms:
+            doc_tf = self.postings[term]
             int_ids = sorted(doc_id_to_int[doc_id] for doc_id in doc_tf)
-            flat: List[int] = []
+            values: List[int] = []
             prev = 0
             for int_id in int_ids:
                 doc_id = doc_ids[int_id]
-                flat.append(int_id - prev)
-                flat.append(doc_tf[doc_id])
+                values.append(int_id - prev)
+                values.append(doc_tf[doc_id])
                 prev = int_id
-            postings_compact[term] = flat
+            term_bytes = vbyte.encode_uints(values)
+            term_lengths.append(len(term_bytes))
+            postings_blob += term_bytes
 
-        payload = {
-            "N": self.N,
-            "avg_doc_len": self.avg_doc_len,
-            "doc_ids": doc_ids,
-            "doc_len": doc_len_arr,
-            "postings": postings_compact,
-        }
-        with open(os.path.join(index_dir, _INDEX_FILENAME), "w", encoding="utf-8") as f:
-            json.dump(payload, f, separators=(",", ":"))
+        meta = {"N": self.N, "avg_doc_len": self.avg_doc_len, "n_docs": len(doc_ids), "n_terms": len(terms)}
+        with open(os.path.join(index_dir, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, separators=(",", ":"))
+        with open(os.path.join(index_dir, "doc_ids.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(doc_ids))
+        with open(os.path.join(index_dir, "doc_len.bin"), "wb") as f:
+            f.write(vbyte.encode_uints(doc_len_arr))
+        with open(os.path.join(index_dir, "vocab_terms.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(terms))
+        with open(os.path.join(index_dir, "vocab_lengths.bin"), "wb") as f:
+            f.write(vbyte.encode_uints(term_lengths))
+        with open(os.path.join(index_dir, "postings.bin"), "wb") as f:
+            f.write(bytes(postings_blob))
 
     @classmethod
     def load(cls, index_dir: str) -> "InvertedIndex":
         """Reconstruct an InvertedIndex purely from what save() wrote to
         `index_dir`. Called in a fresh process — do not rely on any state
         other than what's actually on disk in `index_dir`."""
-        with open(os.path.join(index_dir, _INDEX_FILENAME), encoding="utf-8") as f:
-            payload = json.load(f)
+        with open(os.path.join(index_dir, "meta.json"), encoding="utf-8") as f:
+            meta = json.load(f)
 
         index = cls()
-        index.N = payload["N"]
-        index.avg_doc_len = payload["avg_doc_len"]
-        doc_ids: List[str] = payload["doc_ids"]
-        doc_len_arr: List[int] = payload["doc_len"]
+        index.N = meta["N"]
+        index.avg_doc_len = meta["avg_doc_len"]
+        n_docs = meta["n_docs"]
+        n_terms = meta["n_terms"]
+
+        with open(os.path.join(index_dir, "doc_ids.txt"), encoding="utf-8") as f:
+            content = f.read()
+        doc_ids: List[str] = content.split("\n") if content else []
+
+        with open(os.path.join(index_dir, "doc_len.bin"), "rb") as f:
+            doc_len_bytes = f.read()
+        doc_len_arr, _ = vbyte.decode_uints(doc_len_bytes, n_docs)
         index.doc_len = dict(zip(doc_ids, doc_len_arr))
 
+        with open(os.path.join(index_dir, "vocab_terms.txt"), encoding="utf-8") as f:
+            content = f.read()
+        terms: List[str] = content.split("\n") if content else []
+
+        with open(os.path.join(index_dir, "vocab_lengths.bin"), "rb") as f:
+            lengths_bytes = f.read()
+        term_lengths, _ = vbyte.decode_uints(lengths_bytes, n_terms)
+
+        with open(os.path.join(index_dir, "postings.bin"), "rb") as f:
+            postings_blob = f.read()
+
         index.postings = {}
-        for term, flat in payload["postings"].items():
+        offset = 0
+        for term, length in zip(terms, term_lengths):
+            values = vbyte.decode_all_uints(postings_blob[offset : offset + length])
+            offset += length
             doc_tf: Dict[str, int] = {}
             int_id = 0
-            for i in range(0, len(flat), 2):
-                int_id += flat[i]
-                tf = flat[i + 1]
+            for i in range(0, len(values), 2):
+                int_id += values[i]
+                tf = values[i + 1]
                 doc_tf[doc_ids[int_id]] = tf
             index.postings[term] = doc_tf
 

@@ -43,17 +43,18 @@ persist-in-build / reconstruct-in-load shape.
 """
 from typing import List, Tuple
 
-from submission import bm25, boolean_vsm
+from submission import custom_scorer
 from submission.corpus_utils import load_corpus
 from submission.indexer import InvertedIndex
 
 # ---------------------------------------------------------------------------
-# Module-level state. load_index() populates this (via bm25.build() /
-# boolean_vsm.build()); retrieve() reads it. build_index() runs in a
-# SEPARATE process and cannot rely on this state surviving into
-# load_index()/retrieve() — everything needed at query time is written to
-# index_dir in build_index() (via InvertedIndex.save()) and read back in
-# load_index() (via InvertedIndex.load()).
+# Module-level state. load_index() populates this (via
+# custom_scorer.build(), which in turn builds bm25/boolean_vsm's own
+# caches); retrieve() reads it. build_index() runs in a SEPARATE process
+# and cannot rely on this state surviving into load_index()/retrieve() —
+# everything needed at query time is written to index_dir in
+# build_index() (via InvertedIndex.save()) and read back in load_index()
+# (via InvertedIndex.load()).
 # ---------------------------------------------------------------------------
 _LOADED = False
 
@@ -81,23 +82,27 @@ def load_index(index_dir: str) -> None:
     """
     global _LOADED
     index = InvertedIndex.load(index_dir)
-    bm25.build(index)
-    boolean_vsm.build(index)
+    custom_scorer.build(index)
     _LOADED = True
 
 
 def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs for `query`, best first.
 
-    Uses BM25 as the primary scorer — it carries 70% + 10% of the
-    leaderboard weight (nDCG@10, MAP@10), and Boolean/VSM is graded
-    separately for correctness rather than being the competition entry.
+    Uses submission.custom_scorer's static BM25+/VSM blend as the
+    competition entry — see that module's docstring for the formula and
+    the dev-set evidence for it (nDCG@10 0.667 -> ~0.690, on top of the
+    +0.027 already gained from k1/b tuning, see report.tex). A Rocchio
+    PRF alternative was also implemented and evaluated but rejected (it
+    underperformed plain BM25 on every tested configuration); plain BM25
+    (submission/bm25.py) and TF-IDF/cosine VSM (submission/boolean_vsm.py)
+    remain available and independently correct, but aren't the
+    competition path.
 
-    k1/b below were chosen by a grid sweep (scripts/tune_bm25.py) over
-    the released dev topics/qrels, maximizing nDCG@10 — see
-    runs/bm25_sweep.csv for the full grid. Re-run the sweep and update
-    these if the corpus or dev topics change; a value tuned on one
-    corpus is not guaranteed to transfer to another.
+    k1/b/delta/w below were chosen by grid search on the released dev
+    topics/qrels (scripts/tune_bm25.py, scripts/tune_bm25_vsm_blend.py,
+    scripts/tune_bm25_plus.py) — re-run those and update these values if
+    the corpus or dev topics change.
     """
     if not _LOADED:
         raise RuntimeError(
@@ -108,4 +113,4 @@ def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
             "manually, do the same."
         )
 
-    return bm25.score(query, k, k1=2.5, b=0.6)
+    return custom_scorer.score(query, k, k1=2.5, b=0.6, delta=0.75, w=0.8)
