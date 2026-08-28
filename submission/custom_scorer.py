@@ -37,9 +37,10 @@ query latency is roughly double a bare bm25.score() call.
 from typing import Dict, List, Optional, Tuple
 
 from submission import bm25, boolean_vsm
-from submission.indexer import InvertedIndex
+from submission.indexer import InvertedIndex, tokenize
 
 _BUILT = False
+_INDEX: Optional[InvertedIndex] = None
 
 
 def build(index: InvertedIndex) -> None:
@@ -47,11 +48,35 @@ def build(index: InvertedIndex) -> None:
     caches (bm25._IDF, boolean_vsm._IDF/_DOC_NORMS) are populated,
     regardless of whether retrieve.load_index() also calls
     bm25.build()/boolean_vsm.build() directly — calling build() twice on
-    the same index is idempotent, so this stays correct either way."""
-    global _BUILT
+    the same index is idempotent, so this stays correct either way. Also
+    keeps its own reference to `index`, for the coordination-level bonus
+    (see _coordination_levels()), which needs raw postings directly
+    rather than either sub-scorer's derived (IDF-weighted) state."""
+    global _BUILT, _INDEX
     bm25.build(index)
     boolean_vsm.build(index)
+    _INDEX = index
     _BUILT = True
+
+
+def _coordination_levels(query: str) -> Dict[str, float]:
+    """For every doc_id matching at least one query term, the fraction of
+    *distinct* query terms it contains (Salton's "coordination level
+    match"): 1.0 means every query term is present, 0.5 means half are.
+    A cheap, position-free proxy for "does this document actually
+    address every part of the query," motivated by the error analysis in
+    report.tex — BM25/VSM alone treat query terms independently and give
+    no credit (or penalty) for how many of them a document actually
+    covers together."""
+    terms = set(tokenize(query))
+    if not terms or _INDEX is None:
+        return {}
+    counts: Dict[str, int] = {}
+    for term in terms:
+        for doc_id in _INDEX.postings.get(term, {}):
+            counts[doc_id] = counts.get(doc_id, 0) + 1
+    n_terms = len(terms)
+    return {doc_id: c / n_terms for doc_id, c in counts.items()}
 
 
 def _minmax_normalize(scores: Dict[str, float]) -> Dict[str, float]:
@@ -70,10 +95,14 @@ def score(
     b: float = 0.6,
     delta: float = 0.75,
     w: float = 0.8,
+    gamma: float = 0.0,
 ) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs, ranked by the BM25+/VSM
-    blend described in the module docstring. k1/b/delta/w default to the
-    values found by the dev-set grid search (report.tex)."""
+    blend described in the module docstring, plus `gamma` times the
+    coordination-level bonus (_coordination_levels()) added on top.
+    `gamma=0.0` (default) reproduces the plain BM25+/VSM blend exactly —
+    see scripts/tune_coordination.py for the dev-set sweep that decides
+    whether a nonzero gamma is actually worth shipping."""
     if not _BUILT:
         raise RuntimeError("custom_scorer.build() must be called before custom_scorer.score().")
 
@@ -90,10 +119,16 @@ def score(
 
     bm25_norm = _minmax_normalize(bm25_raw)
     vsm_norm = _minmax_normalize(vsm_raw)
+    coordination = _coordination_levels(query) if gamma else {}
 
     candidates = set(bm25_norm) | set(vsm_norm)
     combined = [
-        (doc_id, w * bm25_norm.get(doc_id, 0.0) + (1 - w) * vsm_norm.get(doc_id, 0.0))
+        (
+            doc_id,
+            w * bm25_norm.get(doc_id, 0.0)
+            + (1 - w) * vsm_norm.get(doc_id, 0.0)
+            + gamma * coordination.get(doc_id, 0.0),
+        )
         for doc_id in candidates
     ]
     combined.sort(key=lambda item: item[1], reverse=True)

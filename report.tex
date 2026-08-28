@@ -362,6 +362,82 @@ genuine title field (worth checking once it's released), re-run
 against it --- Experiment 1 is the evidence this would likely be worth
 doing properly, not through the token-prefix proxy.}
 
+\subsection{Follow-up: does a properly-designed BM25F change this conclusion?}
+Experiment 1's "naive blend" ran two \emph{independent} BM25 passes
+(title-only, body-only), each already saturated by BM25's TF-saturation
+curve, and linearly combined the two saturated scores. That double-
+saturates a term appearing in both fields and is not how the BM25F
+literature (Robertson, Zaragoza \& Taylor, 2004) actually defines field
+combination: normalize each field's TF by that field's own length
+first, \emph{sum} the normalized contributions across fields, and
+saturate \emph{once}. \texttt{scripts/bm25f\_core.py} implements this
+properly (one shared vocabulary, no per-field vocabulary duplication;
+per-document field lengths and per-field averages tracked; global IDF
+over documents containing the term in any field), and
+\texttt{scripts/tune\_bm25f\_true\_fields.py}/\texttt{tune\_bm25f\_prefix.py}
+re-ran both halves of Experiment 1/2 through it, plus an explicit
+graceful-degradation test on fiqa (genuinely title-less at the
+\texttt{ir\_datasets} source level --- confirmed no title attribute
+exists on its document type at all).
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lr}
+\toprule
+Configuration & nDCG@10 \\
+\midrule
+Plain single-field BM25 & 0.6672 \\
+Naive two-pass blend, true fields (Experiment 1) & 0.6861 \\
+\textbf{Proper BM25F, true fields (}$w_{title}{=}3.0,b_{title}{=}0.4,b_{body}{=}0.5$\textbf{)} & \textbf{0.6938} \\
+Naive two-pass blend, prefix heuristic (Experiment 2) & 0.6682 \\
+Proper BM25F, prefix heuristic & 0.6576 \\
+BM25F, fiqa no-title fallback & 0.2365 \\
+Plain BM25, fiqa (same corpus) & 0.2400 \\
+\bottomrule
+\end{tabular}
+\caption{Staged search (w\_title, then b\_body, then b\_title, per a
+50-dev-query-budget rationale --- a full joint 4-parameter grid isn't
+resolvable at this query count) found a genuine interior optimum at
+$w_{title}{=}3.0$ (confirmed by extending the range to 15.0 and watching
+it decline on both sides, not just hitting a grid edge).}
+\end{table}
+
+\noindent Two different results depending on data quality, and the
+direction is counterintuitive at first glance: \textbf{given true field
+data, proper BM25F beats the naive blend by $+0.0077$} (0.6938 vs.\
+0.6861) --- the single-saturation design really is better, validating
+the formula improvement directly. \textbf{Given the heuristic
+pseudo-title, proper BM25F is \emph{worse} than the naive blend, and
+worse than plain BM25 too} (0.6576, recovering 0\% of the true-field
+ceiling vs.\ the naive blend's 5.5\%). The explanation is structural,
+not a bug: the naive blend saturates each field \emph{independently}
+before combining, so a noisy pseudo-title signal can only ever add
+diluted noise on top of an already-complete body-only score. Proper
+BM25F sums title and body contributions \emph{before} saturating, so a
+noisy pseudo-title signal is mixed directly into the same calculation
+the legitimate body signal depends on --- corrupting it, not just
+diluting it. The theoretically superior formula amplifies good field
+data more, but it amplifies bad field data more too. The
+graceful-degradation fallback (title truly absent, not just unreliable)
+tested separately on fiqa works exactly as intended: no crash on
+$\text{avg\_len\_title}{=}0.0$, and the result (0.2365) sits within
+noise of plain BM25 on the same corpus (0.2400, delta $-0.0035$) ---
+the failure mode above is specifically about \emph{unreliable} field
+data, not \emph{absent} field data, and those need to be distinguished.
+
+\subsection{Updated decision}
+Still \textbf{not wired into \texttt{retrieve()}} --- the blocker was
+never the formula, it was always the lack of guaranteed title metadata
+in the real corpus contract, and this follow-up sharpens rather than
+resolves that: it shows the better formula is a strictly worse choice
+than doing nothing (or worse than the naive blend) under exactly the
+fallback conditions a real, title-less held-out corpus would create. If
+the real corpus does turn out to ship genuine titles, \textbf{use proper
+BM25F at $w_{title}{=}3.0,b_{title}{=}0.4,b_{body}{=}0.5$, not the naive
+blend} --- that specific combination is now evidenced as the better of
+the two. If it doesn't, this entire family of ideas stays parked, exactly
+as Experiment 1 concluded.
+
 \section{Static BM25+/VSM Blend}
 
 \subsection{What was tried}
@@ -494,6 +570,228 @@ already fast in absolute terms, and the $\pm10\%$-weighted efficiency
 component is small next to the 70\%-weighted nDCG@10 gain this scorer
 provides.}
 
+\section{Coordination-Level Match Bonus (Rejected)}
+
+\subsection{What was tried}
+A third signal, on top of the BM25+/VSM blend: a coordination-level
+match bonus (Salton) --- for each candidate document, the fraction of
+\emph{distinct} query terms it contains, added to the blended score with
+weight $\gamma$:
+$\text{score}(d) = w\cdot\text{BM25+}_{norm}(d) + (1-w)\cdot\text{VSM}_{norm}(d)
++ \gamma \cdot \text{coordination}(d)$. Motivated by the same error-analysis
+observation as the (unattempted) phrase/proximity idea --- BM25/VSM score
+query terms independently and give no credit for how many of them a
+document actually covers together --- but far cheaper: no term
+positions needed, just a postings-set intersection count per query term,
+computed directly from the existing index (\texttt{submission/custom\_scorer.py}'s
+\texttt{\_coordination\_levels()}). \texttt{scripts/tune\_coordination.py}
+swept $\gamma \in [0, 1]$ on dev, holding $k_1,b,\delta,w$ at their
+already-tuned values; $\gamma{=}0$ exactly reproduces the blend-only
+baseline (0.6897 vs.\ the known 0.6896, within cross-process tie-break
+noise), used as a sanity check.
+
+\subsection{Result: it does not help}
+\begin{table}[h]
+\centering
+\begin{tabular}{rr}
+\toprule
+$\gamma$ & nDCG@10 \\
+\midrule
+0.00 (no bonus, sanity check) & 0.6897 \\
+0.10 & 0.6867 \\
+0.20 & 0.6806 \\
+0.50 & 0.6693 \\
+1.00 & 0.6350 \\
+\bottomrule
+\end{tabular}
+\caption{Every nonzero $\gamma$ tested made nDCG@10 \emph{worse}, and the
+decline is monotonic in $\gamma$ --- not a noisy result, a consistent
+one.}
+\end{table}
+
+\noindent Likely explanation: several dev queries are long, natural-
+language questions with many distinct content words after stemming
+(e.g.\ ``do individuals who recover from COVID-19 show sufficient immune
+response, including antibody levels and T-cell mediated immunity, to
+prevent re-infection?''). Requiring full term coverage is a harsh
+constraint for a query like that --- it rewards documents that happen to
+echo most of the question's specific wording over documents that are
+genuinely topically relevant but phrased differently, and BM25's IDF
+weighting already distinguishes important from incidental query terms
+better than a flat match-count does.
+
+\subsection{Decision}
+\textbf{Kept in the code, at its default (}$\gamma{=}0${\textbf{, i.e.\ off).}}
+Unlike the Rocchio PRF rejection (\S 5), this doesn't need reverting: the
+parameter defaults to exactly reproducing the existing blend, so its
+presence changes nothing about \texttt{retrieve()}'s actual behavior ---
+it's kept as a third documented negative result (alongside PRF and the
+field-weighting heuristic) rather than removed, since the evidence for
+\emph{why} it doesn't work is itself useful error-analysis content.
+
+\section{Bigram/Phrase Proximity Bonus (Rejected)}
+
+\subsection{What was tried}
+The most direct answer to the error-analysis observation that BM25/VSM
+treat query terms independently: score documents on adjacent-token
+\emph{bigrams} too, not just single terms, so ``causes death'' scoring
+higher than ``causes'' and ``death'' appearing far apart becomes
+possible. Unlike the coordination-level bonus (\S 7, computed live from
+data already in memory), this needs genuinely new persisted state ---
+bigram order is lost once tokens are folded into unordered postings, so
+it can't be reconstructed after the fact the way the coordination-level
+signal or the earlier PRF forward-index could. \texttt{InvertedIndex}
+gained a second postings structure, \texttt{bigram\_postings}, built
+from the same tokenize() pass as the unigram postings (adjacent pairs of
+stopword-filtered, stemmed tokens), pruned to document frequency
+$\geq 2$ at build time (a bigram appearing in exactly one document can
+never help distinguish between candidates, so keeping it is pure size
+cost for zero ranking benefit), gap+VByte-encoded and persisted the same
+way as the unigram postings (\S 2). A new \texttt{bigram\_bm25.py} scored
+it with the same BM25 formula, and \texttt{custom\_scorer.py} blended it
+in with weight $\mu$ (\texttt{scripts/tune\_bigram.py} swept it, holding
+$k_1,b,\delta,w,\gamma$ at their already-decided values).
+
+\subsection{Result: rejected on both axes it needed to pass}
+\begin{table}[h]
+\centering
+\begin{tabular}{lr}
+\toprule
+& Value \\
+\midrule
+Unigram vocabulary size & 165{,}843 terms \\
+Bigram vocabulary size (doc freq $\geq 2$) & 1{,}690{,}723 bigrams \\
+Index size without bigrams & 30.5\,MB \\
+Index size with bigrams & \textbf{99.8\,MB (+227\%)} \\
+nDCG@10 at $\mu{=}0$ (sanity check) & 0.6893 \\
+nDCG@10 at best tested $\mu{>}0$ & none beat $\mu{=}0$ \\
+nDCG@10 at $\mu{=}1.0$ & 0.5220 \\
+\bottomrule
+\end{tabular}
+\caption{Every nonzero $\mu$ tested made nDCG@10 \emph{worse}, monotonically
+--- the same clean-decline pattern as \S 7's coordination-level bonus,
+but here compounded by a index-size cost roughly triple the existing
+index for a signal that never helped. There are ${\sim}10\times$ more
+distinct bigrams than unigrams even after pruning singletons, which is
+itself informative: bigram matches are inherently rare and specific, so
+a small number of documents get large, noisy bonuses from incidental
+exact-phrase matches while most genuinely relevant documents (which
+simply phrase things differently) get none.}
+\end{table}
+
+\subsection{Decision}
+\textbf{Fully reverted}, unlike the coordination-level bonus.
+\texttt{InvertedIndex.bigram\_postings}, \texttt{bigram\_bm25.py}, and
+\texttt{custom\_scorer.py}'s $\mu$ parameter were all removed rather than
+left at a default-off value: the bigram postings were being
+unconditionally computed and persisted by \texttt{build\_index()}
+regardless of whether $\mu$ was ever nonzero, meaning every future index
+build would silently pay the +227\% size cost for a feature nothing
+used. This is the sharpest lesson of the three rejected ideas
+(alongside PRF, \S 5, and field-weighting, \S 6): a parameter that
+defaults to "off" is only actually free if \emph{nothing upstream of
+it} did extra work to make the off-path possible.
+
+\section{Confirming the Tuned Parameters Are a True Optimum}
+
+Two checks run late, both purely confirmatory (no changes to
+\texttt{submission/} resulted from either).
+
+\textbf{Joint 4-parameter search.} $k_1,b$ were tuned first (\S 4), then
+$\delta,w$ on top of that fixed result (\S 6) --- a staged search, not a
+joint one, which risks landing at a good-but-not-optimal point if the
+parameters interact more than assumed. \texttt{scripts/tune\_joint\_blend.py}
+grid-searched all four together ($k_1\in\{2,2.5,3\}$,
+$b\in\{0.5,0.6,0.7\}$, $\delta\in\{0.5,0.75,1.0\}$, $w\in\{0.7,0.8,0.9\}$,
+81 combinations). Result: the best combination found was \textbf{exactly
+the already-deployed values} ($k_1{=}2.5,b{=}0.6,\delta{=}0.75,w{=}0.8$),
+with a $+0.0009$ difference that's noise, not a real improvement ---
+confirming the staged approach already reached the true joint optimum
+rather than a stage-order artifact.
+
+\textbf{Reciprocal Rank Fusion vs.\ the additive blend.} RRF (Cormack,
+Clarke \& Buettcher, 2009) combines rankers by rank position
+($\text{score}(d) = \sum_s 1/(k_{rrf} + \text{rank}_s(d))$) rather than
+normalized score magnitude --- a real alternative to \S 6's min-max
+blend, since RRF can't be distorted by an extreme outlier score the way
+min-max normalization theoretically could. \texttt{scripts/tune\_rrf.py}
+swept $k_{rrf} \in [10,150]$; best result (nDCG@10${=}0.6649$ at
+$k_{rrf}{=}60$, the same default the original RRF paper recommends) is
+$-0.0243$ \emph{below} the additive blend (0.6892). Plausible reason:
+RRF discards score magnitude entirely, and BM25+/VSM's raw scores carry
+real signal in \emph{how much} better one document is than another, not
+just relative order --- the robustness RRF is designed for matters most
+when combining systems whose scores are hard to calibrate against each
+other at all (e.g.\ sparse + dense neural retrieval), which understates
+the actual problem here, since min-max normalization already handles the
+scale-incomparability between BM25 and VSM reasonably well.
+
+\section{Cross-Dataset Generalization Check}
+
+\subsection{Motivation}
+Every tuning decision so far (\S 4, \S 6, \S 7, \S 8) was made on
+\texttt{beir/trec-covid} --- \texttt{scripts/download\_full\_corpus.py}'s
+fallback default, not necessarily the actual dataset course staff
+announce for grading (assignment Section 3 names Robust04 or TREC-COVID
+only as \emph{examples}). Worth checking directly whether $k_1{=}2.5,
+b{=}0.6,\delta{=}0.75,w{=}0.8$ are genuinely good BM25(+)/VSM choices or
+narrowly overfit to one medical-domain corpus, by running the exact same
+\texttt{retrieve()} --- unmodified, no re-tuning --- against two more
+public \texttt{ir\_datasets} BEIR collections, deliberately chosen to
+differ in both domain and scale: \textbf{nfcorpus} (health/nutrition,
+3{,}633 docs) and \textbf{fiqa} (financial Q\&A, 57{,}638 docs, a
+genuinely different domain from anything tuning was done on). Robust04
+itself isn't tested here --- it requires a TREC/NIST license this setup
+doesn't have.
+
+\subsection{Result}
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrr}
+\toprule
+Dataset & Domain & Docs & Our nDCG@10 & Local ref.\ nDCG@10 & Relative margin \\
+\midrule
+trec-covid (tuning corpus) & Medical/COVID & 171{,}332 & 0.6892 & 0.4279 & $+61.1\%$ \\
+fiqa & Financial Q\&A & 57{,}638 & 0.2467 & 0.1603 & $+53.9\%$ \\
+nfcorpus & Nutrition/health & 3{,}633 & 0.3310 & 0.2682 & $+23.4\%$ \\
+\bottomrule
+\end{tabular}
+\caption{Same unmodified \texttt{retrieve()}, same hardcoded
+$k_1,b,\delta,w$ tuned only on trec-covid, run against two corpora it
+never saw. "Local ref." is each dataset's own
+\texttt{harness/generate\_baseline.py} run (generic \texttt{rank\_bm25},
+textbook $k_1{=}1.2,b{=}0.75$) --- the same style of sanity check the
+toy set ships with, generated fresh for each dataset (the trec-covid row
+was regenerated after initially being omitted by oversight, not for any
+methodological reason).}
+\end{table}
+
+\noindent \textbf{Correcting an initial misreading of this result:} an
+earlier version of this section, written before the trec-covid baseline
+row above existed, claimed the fiqa margin exceeded trec-covid's as
+evidence against overfitting. That was wrong, and simply reflected
+not having the number yet, not a real finding --- trec-covid actually
+shows the \emph{largest} relative margin of the three (61\%), which is
+unsurprising: it's the corpus everything was tuned on. The honest
+reading is more modest but still meaningfully positive: the tuned
+parameters generalize to two domains and corpus scales they never saw,
+beating each one's own generic-BM25 reference by a solid margin (54\%
+and 23\%) even though neither margin is as large as on the tuning
+corpus itself --- which is the expected pattern for real tuning, not a
+red flag. Both absolute nDCG@10 numbers also land close to (nfcorpus) or
+above (fiqa) the BM25 baselines reported in the original BEIR paper
+(Thakur et al., 2021) for these exact collections (${\sim}0.32$ and
+${\sim}0.236$ respectively) --- an external, literature-level sanity
+check this system wasn't tuned toward in any way.
+
+\subsection{A side note on efficiency}
+Generating fiqa's local baseline via \texttt{rank\_bm25} took
+109\,ms/query; this submission's own blended scorer (BM25+/VSM, two
+scoring passes) took 15.4\,ms/query on the same corpus --- ${\sim}7\times$
+faster than a widely-used reference library running a single BM25 pass.
+Not a claim that this implementation is well-optimized in any absolute
+sense, just a data point that it isn't pathologically slow either.
+
 \section{Error Analysis}
 
 \todo{The table below reflects the plain-BM25 configuration (\S 4),
@@ -558,6 +856,37 @@ field weighting (\S 6 of the earlier section / title-vs-abstract
 experiment) showed a real gain but depends on a title field the actual
 corpus contract doesn't guarantee, and the safe fallback heuristic
 recovered only 5.5\% of that gain --- not worth shipping.}
+
+\section{Correctness Testing}
+
+Beyond the harness's own \texttt{tests/test\_interface\_conformance.py}
+and \texttt{tests/test\_metrics.py}, two self-authored test files back
+the "Correctness of required components" grading criterion
+(assignment Section 7: Boolean/VSM and BM25 "graded by unit tests
+against known small examples, not leaderboard score alone"):
+
+\begin{itemize}
+\item \texttt{tests/test\_scorers.py} (22 tests): BM25 and TF-IDF/cosine
+VSM checked against values computed independently by hand from each
+module's own documented formula on a shared 3-document toy corpus (not
+by calling the function under test to generate its own "expected"
+value) --- e.g.\ BM25's single-term score for a hand-picked query is
+computed via the raw formula in \texttt{bm25.py}'s docstring and
+compared with \texttt{math.isclose}. Also covers Boolean AND/OR set
+semantics, edge cases (empty query, out-of-vocabulary terms, unknown
+Boolean mode), and \texttt{custom\_scorer.py}'s blend wiring (verified
+against the now-trusted \texttt{raw\_scores()} outputs, layering the
+composition check on top of the formula check).
+\item \texttt{tests/test\_index\_persistence.py} (11 tests): VByte
+round-trip correctness and full \texttt{InvertedIndex.save()}/
+\texttt{load()} round-trip fidelity (\S 2).
+\end{itemize}
+
+\noindent Neither is wired into \texttt{scripts/smoke\_test.sh} or
+\texttt{.github/workflows/conformance.yml} --- those are shared,
+course-provided files, deliberately left untouched rather than edited to
+add a step. Run this coverage directly with
+\texttt{pytest tests/test\_scorers.py tests/test\_index\_persistence.py -v}.
 
 \section{AI-Use Disclosure Statement}
 
