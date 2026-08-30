@@ -10,7 +10,7 @@
 % repository's code, with the exact commands used, so every number here
 % is reproducible.
 %
-% Compile with: pdflatex report.tex (needs pgfplots for Section 4's
+% Compile with: pdflatex report.tex (needs pgfplots for Section 3's
 % plots; run twice for cross-references/ToC if added later).
 
 \documentclass[11pt]{article}
@@ -110,6 +110,69 @@ Pure-Python VByte decoding (a per-integer bit-shift loop) is slower than
 \texttt{json.load()}'s C parser, even though it processes far fewer
 bytes. This is a real cost against the efficiency component, traded for
 the much larger index-size win --- not a free lunch.
+
+\subsection{Follow-up: 2-bit tf codes and a front-coded dictionary}
+\label{sec:tfcodes}
+
+\textbf{Where the 29.1MB actually goes.} Before optimizing further, the
+persisted index was broken down file-by-file (full corpus,
+171{,}332 docs): \texttt{postings.bin} is 89.0\% of the total
+(27.2MB), \texttt{doc\_ids.txt} 5.1\%, \texttt{vocab\_terms.txt} 4.5\%,
+\texttt{doc\_len.bin} 0.8\%, \texttt{vocab\_lengths.bin} 0.6\%. Splitting
+\texttt{postings.bin} further by decoding it back into its (gap, tf)
+pairs: the \emph{tf} stream alone costs 12.2MB (45\% of
+\texttt{postings.bin}) even though \textbf{72.6\% of all 12.2M postings
+have tf == 1, and 95.8\% have tf $\le$ 4} --- VByte still spends a full
+byte on nearly every one of them, since a byte is VByte's smallest
+addressable unit.
+
+\textbf{Fix.} Gaps and term frequencies are now written as two
+\emph{separate} streams (\texttt{postings\_gaps.bin},
+\texttt{postings\_tf\_codes.bin} + \texttt{postings\_tf\_escapes.bin})
+instead of interleaved, since mixing two differently-distributed integer
+streams into one blob wastes bits it doesn't need to. Each tf is reduced
+to a 2-bit code (\texttt{submission/bitpack.py}, packed 4-to-a-byte):
+0/1/2 mean tf is exactly 1/2/3, and 3 is an escape meaning ``see the next
+value in a separate VByte-encoded escape list'' --- only the 4.2\% of
+postings with tf $\ge$ 4 pay for an actual multi-bit value. The
+dictionary itself is also now \emph{front-coded}
+(\texttt{submission/frontcode.py}): sorted, stemmed terms share 4.6 of
+their 7.3 characters with the previous term on average (measured
+directly, not assumed), so each term is stored as (shared-prefix-length,
+suffix) instead of its full text --- \texttt{vocab\_terms.txt} is
+replaced by \texttt{vocab\_prefix\_lens.bin} + \texttt{vocab\_suffixes.txt}.
+No block-based restart points (the textbook version of front coding
+usually has them, for binary-searching a specific term without decoding
+the whole dictionary): \texttt{InvertedIndex.load()} already decodes the
+entire vocabulary sequentially into memory regardless --- nothing in this
+codebase ever looks up one term on disk without loading the rest --- so
+block heads would trade dictionary size back for a random-access
+capability nothing here uses.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+ & VByte (before) & + tf codes & + front-coded dict \\
+\midrule
+Index size (171{,}332 docs) & 29.1MB & 21.2MB (--27.2\%) & \textbf{20.6MB (--29.2\%)} \\
+nDCG@10 (full harness run) & 0.6899 & 0.6898 & 0.6897 \\
+Build time & 16.1s & 16.1s & 15.6s \\
+Load time & 4.4s & 4.4s & 4.0s \\
+\bottomrule
+\end{tabular}
+\caption{Each step measured via the real
+\texttt{build\_index()}/\texttt{load\_index()}/\texttt{retrieve()}
+harness path, not a side script. nDCG@10 differences across the three
+columns are within the known cross-process tie-break noise (Python
+dict/set iteration order for tied scores depends on
+\texttt{PYTHONHASHSEED}, which differs across the harness's separate
+build/load processes) --- ranking quality is unaffected; only the
+on-disk representation changed. Round-trip correctness for both new encodings is
+covered by dedicated unit tests
+(\texttt{tests/test\_index\_persistence.py}), including a synthetic
+tf $\ge$ 4 case since the toy corpus never naturally produces one.}
+\end{table}
 
 \section{Boolean/VSM vs. BM25 Comparison}
 
@@ -350,13 +413,13 @@ queries, not a real improvement.}
 
 \subsection{Decision}
 \textbf{Not wired into \texttt{retrieve()}.} The pattern here is the
-inverse of \S 5's PRF result: the \emph{idea} is validated (field
+inverse of \S 4's PRF result: the \emph{idea} is validated (field
 weighting is a real, sizeable win when genuine title metadata exists),
 but the specific mechanism available under this assignment's actual
 corpus contract (a single flat \texttt{text} field, no guaranteed title)
 cannot safely reconstruct enough of that signal to justify the added
 complexity and doubled query latency (two BM25 passes per query, as in
-\S 5). \todo{If the real announced/held-out corpus turns out to ship a
+\S 4). \todo{If the real announced/held-out corpus turns out to ship a
 genuine title field (worth checking once it's released), re-run
 \texttt{scripts/tune\_field\_weights.py}-style field weighting directly
 against it --- Experiment 1 is the evidence this would likely be worth
@@ -448,7 +511,7 @@ Two further, independent modifications to the base BM25 scorer:
 \text{BM25}_{norm}(d) + (1-w)\cdot\text{VSM}_{norm}(d)$, each min-max
 normalized per query into $[0,1]$ first (BM25 is unbounded, VSM cosine
 is already in $[0,1]$ --- not comparable on a shared scale otherwise).
-Unlike \S 5's Rocchio PRF, this blends two rankers that each score the
+Unlike \S 4's Rocchio PRF, this blends two rankers that each score the
 \emph{original}, unexpanded query independently, so it isn't vulnerable
 to PRF's topic-drift failure mode.
 \item \textbf{BM25+} (Lv \& Zhai, 2011): adds a small constant $\delta$
@@ -550,25 +613,191 @@ nDCG@10 & 0.6899 & 0.6896 \\
 \end{tabular}
 \caption{Full \texttt{build\_index()}/\texttt{load\_index()}/\texttt{retrieve()}
 harness runs, before and after removing the redundant sorts. The
-$0.0003$ nDCG@10 difference is cross-process score-tie-break noise (see
-\S 4's discussion of \texttt{PYTHONHASHSEED}-dependent set iteration
-order for tied scores), not a ranking regression.}
+$0.0003$ nDCG@10 difference is cross-process score-tie-break noise
+(Python dict/set iteration order for tied scores depends on
+\texttt{PYTHONHASHSEED}, which differs across the harness's separate
+build/load processes), not a ranking regression.}
 \end{table}
 
 \subsection{What's left on the table}
 105\,ms/query is close to the sum of running BM25 and VSM independently
 (88\,ms) --- there isn't much redundant work left to remove without a
-more invasive redesign. \todo{Two further directions, not attempted:
-(1) restrict the VSM pass to a candidate pool (e.g.\ BM25's own top-$N$)
+more invasive redesign. Two further directions were identified: (1)
+restrict the VSM pass to a candidate pool (e.g.\ BM25's own top-$N$)
 instead of scoring every document any query term matches, trading a
 small risk of missing a VSM-favored-but-BM25-unfavored document for
 speed; (2) a compiled extension (Cython/pybind11, permitted per
-\texttt{docs/SUBMISSION\_INTERFACE.md}) for the inner scoring loops ---
+\texttt{docs/SUBMISSION\_INTERFACE.md}) for the inner scoring loops.
+Direction (1) was revisited and implemented --- see \S\ref{sec:pruning}
+below. \todo{Direction (2), the compiled extension, was not attempted;
 the assignment explicitly expects this to give a real efficiency
-advantage over pure Python. Neither was necessary here: 105\,ms is
-already fast in absolute terms, and the $\pm10\%$-weighted efficiency
-component is small next to the 70\%-weighted nDCG@10 gain this scorer
-provides.}
+advantage over pure Python, and is the largest remaining lever if the
+efficiency component needs to matter more than it currently does against
+the 70\%-weighted nDCG@10 gain this scorer provides.}
+
+\section{Follow-up: Candidate-Set Pruning for Query Latency}
+\label{sec:pruning}
+
+\subsection{Diagnosis: where the remaining time actually goes}
+With the redundant sorts already removed (\S\ref{sec:latency}),
+\texttt{custom\_scorer.score()} was profiled again, phase by phase, on 5
+real dev queries against the full corpus:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lr}
+\toprule
+Phase & Time \\
+\midrule
+\texttt{bm25.raw\_scores()} & 20.7\,ms \\
+\texttt{boolean\_vsm.raw\_scores()} & 18.1\,ms \\
+min-max normalize ($\times 2$) & 10.5\,ms \\
+\textbf{union + combine + sort} & \textbf{30.9\,ms} \\
+\midrule
+Total & 80.2\,ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent The combine-and-sort step is the single largest cost ---
+bigger than either scorer individually. The reason: candidate sets are
+huge, 37K--101K documents matched per query out of 171{,}332 total,
+since these are disjunctive queries and terms like ``covid''/``19''
+appear in most of a COVID-focused corpus.
+
+\subsection{Fix 1: \texttt{heapq.nlargest} instead of a full sort}
+Only the top $k$ (typically 10) of up to 101K candidates are ever
+needed, but \texttt{sorted(...)[:k]} is $O(n \log n)$ over the whole set.
+Replaced with \texttt{heapq.nlargest(k, ..., key=...)} in
+\texttt{bm25.score()}, \texttt{boolean\_vsm.vsm\_score()}, and
+\texttt{custom\_scorer.score()} --- $O(n \log k)$. Verified stable and
+tie-break-identical to \texttt{sorted()} on synthetic tied-score data
+before relying on it (same output, not just ``probably fine''):
+
+\begin{table}[h]
+\centering
+\begin{tabular}{rrrr}
+\toprule
+Candidates ($n$) & Full sort & \texttt{heapq.nlargest} & Speedup \\
+\midrule
+37{,}000 & 4.3\,ms & 0.8\,ms & 5.6$\times$ \\
+101{,}000 & 13.2\,ms & 2.1\,ms & 6.3$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Fix 2: restrict the VSM pass to BM25's top-$N$ candidates}
+\texttt{boolean\_vsm.py} gained
+\texttt{raw\_scores\_for\_candidates(query, candidate\_ids)}: the same
+cosine formula as \texttt{raw\_scores()}, but iterating
+candidates-then-terms instead of terms-then-full-postings --- cheap when
+the candidate pool is small, since it no longer touches every posting of
+every query term. \texttt{custom\_scorer.score()} gained
+\texttt{vsm\_pool\_size}: takes BM25's own top-$N$ candidates (via
+\texttt{heapq.nlargest} on the raw BM25 scores) as the VSM candidate
+pool, instead of scoring every document any query term matches. This is
+an approximation --- a document outside the pool is scored as VSM$=0$,
+the same fallback already used for a document VSM found no term overlap
+with at all --- so it was swept directly against dev nDCG@10 and latency
+(\texttt{scripts/tune\_vsm\_pool\_size.py}) rather than assumed safe:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrr}
+\toprule
+\texttt{vsm\_pool\_size} & nDCG@10 & $\Delta$ vs.\ unrestricted & Mean latency \\
+\midrule
+100 & 0.6879 & $-0.0031$ & 64.4\,ms \\
+1{,}000 & 0.6869 & $-0.0042$ & 67.2\,ms \\
+2{,}000 & 0.6907 & $-0.0003$ & 69.3\,ms \\
+\textbf{5{,}000} & \textbf{0.6924} & \textbf{$+0.0014$} & \textbf{76.7\,ms} \\
+unrestricted (all candidates) & 0.6910 & --- & 173.5\,ms \\
+\bottomrule
+\end{tabular}
+\caption{Full sweep in \texttt{scripts/tune\_vsm\_pool\_size.py}; this
+table is a subset (see the script's own printed output for every value
+tested). Latencies here are from an in-process sweep (repeated
+\texttt{custom\_scorer.score()} calls in one warm process), so absolute
+numbers run higher than the harness's cold-process measurement below ---
+relative comparison across pool sizes is what matters.}
+\end{table}
+
+\noindent 1{,}000 was the first value tried and already looked
+reasonable, but costs a real, reproducible $\sim$0.003--0.006 nDCG@10 versus
+unrestricted (confirmed across repeated runs, distinguishing it from the
+$\sim$0.0003--0.0008 known tie-break noise band). 5{,}000 \emph{matches or
+slightly exceeds} the unrestricted score while still cutting latency
+substantially --- plausible explanation: $w{=}0.8$ already weights
+BM25+ four times more than VSM in the blend, so a document with a low
+BM25 score (and therefore excluded even by a fairly generous pool)
+contributes little to the final ranking regardless of what VSM would
+have scored it. Shipped as the default
+(\texttt{submission/custom\_scorer.py}, \texttt{submission/retrieve.py}).
+
+\subsection{Result}
+\begin{table}[h]
+\centering
+\begin{tabular}{lrr}
+\toprule
+ & Before (\S\ref{sec:latency}'s fix) & After both fixes above \\
+\midrule
+Mean query latency & 105.3\,ms & \textbf{65.6\,ms (--38\%)} \\
+Max query latency & 221.7\,ms & 131.9\,ms (--40\%) \\
+nDCG@10 & 0.6896 & 0.6917 \\
+Index size & 20.6MB & 20.6MB (unaffected) \\
+\bottomrule
+\end{tabular}
+\caption{Full \texttt{build\_index()}/\texttt{load\_index()}/\texttt{retrieve()}
+harness run on the full corpus. nDCG@10 moved \emph{up}, not down ---
+quality was preserved, not traded away for speed; correctness is backed
+by dedicated unit tests for \texttt{raw\_scores\_for\_candidates()}
+(\texttt{tests/test\_scorers.py}), including one that pins the pool
+restriction actually changes behavior end-to-end, not just that the
+parameter exists.}
+\end{table}
+
+\subsection{Considered and rejected: Block-Max WAND / skip pointers}
+A real technique for pruning disjunctive candidate sets using per-block
+score upper bounds to skip regions that provably can't enter the top-$k$
+--- but it doesn't cleanly fit this scorer's design. The blend computes
+$w \cdot \text{minmax}(\text{BM25}) + (1-w) \cdot \text{minmax}(\text{VSM})$,
+and min-max normalization needs the \emph{true} min and max over the
+\emph{entire} matched candidate set before any single document's final
+score is known --- exactly the full materialization WAND-style pruning
+is designed to avoid. Implementing true WAND here would mean redesigning
+the blend's normalization (e.g.\ static/theoretical score bounds instead
+of empirical per-query min/max), not just adding a skip-list on top of
+the existing scorer. \textbf{Decision: not implemented.} The
+candidate-pool restriction above (Fix 2) captures a similar practical
+benefit --- fewer documents fully scored --- without requiring that
+redesign, at the cost of being an approximation validated empirically
+rather than an exact top-$k$ under the true (unrestricted) score
+function.
+
+\subsection{Considered and rejected: single-pass in-memory inversion (SPIMI) for build time}
+\texttt{build\_index()} was profiled separately: \texttt{load\_corpus()}
+(JSON parsing) 0.32s, \texttt{InvertedIndex.build()}
+(tokenize+stem+postings) 8.96s, \texttt{InvertedIndex.save()}
+(encode+write) 6.10s --- 15.4s total. SPIMI's benefit over BSBI is
+avoiding multiple passes and an external merge-sort when the index
+doesn't fit in memory. This implementation is already a single Python
+process building postings directly in RAM in one pass over the corpus
+--- there is no external-sort step to eliminate, so implementing
+``SPIMI'' here would relabel the existing fast path rather than speed it
+up. \textbf{Decision: not implemented} --- the problem it solves doesn't
+exist in this architecture. \texttt{cProfile} on
+\texttt{InvertedIndex.build()} instead identified the Python-level
+postings-construction loop itself (\texttt{dict.setdefault}/
+\texttt{dict.get} calls, 12.2M and 19.4M respectively) as the largest
+single contributor ($\sim$48\% of that phase), ahead of the from-scratch
+Porter stemmer ($\sim$35\%) and the initial tokenization regex
+($\sim$13\%) --- a \texttt{collections.Counter}-based tf-counting loop
+would be the correctly-targeted fix if build time is revisited, not
+SPIMI. \todo{Not attempted: build time (15.4s) is already comfortably
+inside the assignment's ``minutes on a laptop'' tolerance, and efficiency
+is a small, combined (build + query latency) $\pm10\%$ of the leaderboard
+score against nDCG@10's 70\% --- revisit only if there's time left after
+higher-weighted items.}
 
 \section{Coordination-Level Match Bonus (Rejected)}
 
@@ -622,7 +851,7 @@ better than a flat match-count does.
 
 \subsection{Decision}
 \textbf{Kept in the code, at its default (}$\gamma{=}0${\textbf{, i.e.\ off).}}
-Unlike the Rocchio PRF rejection (\S 5), this doesn't need reverting: the
+Unlike the Rocchio PRF rejection (\S 4), this doesn't need reverting: the
 parameter defaults to exactly reproducing the existing blend, so its
 presence changes nothing about \texttt{retrieve()}'s actual behavior ---
 it's kept as a third documented negative result (alongside PRF and the
@@ -636,7 +865,7 @@ The most direct answer to the error-analysis observation that BM25/VSM
 treat query terms independently: score documents on adjacent-token
 \emph{bigrams} too, not just single terms, so ``causes death'' scoring
 higher than ``causes'' and ``death'' appearing far apart becomes
-possible. Unlike the coordination-level bonus (\S 7, computed live from
+possible. Unlike the coordination-level bonus (\S 9, computed live from
 data already in memory), this needs genuinely new persisted state ---
 bigram order is lost once tokens are folded into unordered postings, so
 it can't be reconstructed after the fact the way the coordination-level
@@ -647,7 +876,7 @@ stopword-filtered, stemmed tokens), pruned to document frequency
 $\geq 2$ at build time (a bigram appearing in exactly one document can
 never help distinguish between candidates, so keeping it is pure size
 cost for zero ranking benefit), gap+VByte-encoded and persisted the same
-way as the unigram postings (\S 2). A new \texttt{bigram\_bm25.py} scored
+way as the unigram postings (\S 1). A new \texttt{bigram\_bm25.py} scored
 it with the same BM25 formula, and \texttt{custom\_scorer.py} blended it
 in with weight $\mu$ (\texttt{scripts/tune\_bigram.py} swept it, holding
 $k_1,b,\delta,w,\gamma$ at their already-decided values).
@@ -669,7 +898,7 @@ nDCG@10 at $\mu{=}1.0$ & 0.5220 \\
 \bottomrule
 \end{tabular}
 \caption{Every nonzero $\mu$ tested made nDCG@10 \emph{worse}, monotonically
---- the same clean-decline pattern as \S 7's coordination-level bonus,
+--- the same clean-decline pattern as \S 9's coordination-level bonus,
 but here compounded by a index-size cost roughly triple the existing
 index for a signal that never helped. There are ${\sim}10\times$ more
 distinct bigrams than unigrams even after pruning singletons, which is
@@ -688,7 +917,7 @@ unconditionally computed and persisted by \texttt{build\_index()}
 regardless of whether $\mu$ was ever nonzero, meaning every future index
 build would silently pay the +227\% size cost for a feature nothing
 used. This is the sharpest lesson of the three rejected ideas
-(alongside PRF, \S 5, and field-weighting, \S 6): a parameter that
+(alongside PRF, \S 4, and field-weighting, \S 5): a parameter that
 defaults to "off" is only actually free if \emph{nothing upstream of
 it} did extra work to make the off-path possible.
 
@@ -697,7 +926,7 @@ it} did extra work to make the off-path possible.
 Two checks run late, both purely confirmatory (no changes to
 \texttt{submission/} resulted from either).
 
-\textbf{Joint 4-parameter search.} $k_1,b$ were tuned first (\S 4), then
+\textbf{Joint 4-parameter search.} $k_1,b$ were tuned first (\S 3), then
 $\delta,w$ on top of that fixed result (\S 6) --- a staged search, not a
 joint one, which risks landing at a good-but-not-optimal point if the
 parameters interact more than assumed. \texttt{scripts/tune\_joint\_blend.py}
@@ -729,7 +958,7 @@ scale-incomparability between BM25 and VSM reasonably well.
 \section{Cross-Dataset Generalization Check}
 
 \subsection{Motivation}
-Every tuning decision so far (\S 4, \S 6, \S 7, \S 8) was made on
+Every tuning decision so far (\S 3, \S 6, \S 9, \S 10) was made on
 \texttt{beir/trec-covid} --- \texttt{scripts/download\_full\_corpus.py}'s
 fallback default, not necessarily the actual dataset course staff
 announce for grading (assignment Section 3 names Robust04 or TREC-COVID
@@ -794,7 +1023,7 @@ sense, just a data point that it isn't pathologically slow either.
 
 \section{Error Analysis}
 
-\todo{The table below reflects the plain-BM25 configuration (\S 4),
+\todo{The table below reflects the plain-BM25 configuration (\S 3),
 \emph{before} the BM25+/VSM blend in \S 6 was wired in. Re-generate
 against the final \texttt{retrieve()} (blended scorer) for full
 consistency before submitting --- the specific worst queries and their
@@ -846,16 +1075,31 @@ uses \texttt{submission/custom\_scorer.py}'s static BM25+/VSM blend
 ($k_1{=}2.5$, $b{=}0.6$, $\delta{=}0.75$, $w{=}0.8$; \S 6) over a
 stemmed, stopword-filtered index --- BM25+ and VSM scores min-max
 normalized per query and linearly combined, chosen because it beat plain
-tuned BM25 by $+0.023$ nDCG@10 (\S 6) at a real but acceptable query-latency
-cost (${\sim}154$ms mean, up from ${\sim}40$ms). Boolean retrieval is
+tuned BM25 by $+0.023$ nDCG@10 (\S 6) at a real but acceptable
+query-latency cost. That cost was substantially reduced after this
+paragraph was first drafted: two follow-up passes
+(\S\ref{sec:latency}, removing redundant sorts, and
+\S\ref{sec:pruning}, \texttt{heapq.nlargest} plus a BM25-top-$N$
+candidate pool for VSM) brought mean query latency from an initial
+${\sim}154$ms (up from ${\sim}40$ms for plain BM25) down to
+${\sim}66$ms, with nDCG@10 unchanged or slightly improved throughout.
+The index itself was also compressed further after this paragraph was
+first drafted (\S\ref{sec:tfcodes}: 2-bit tf codes plus a front-coded
+dictionary), taking the persisted index from 29.1MB to 20.6MB with no
+ranking-quality cost. Boolean retrieval is
 implemented and independently correct but not part of the ranked
 competition path (\S 2). Two alternative directions were implemented,
 evaluated on dev, and deliberately \emph{not} shipped: Rocchio PRF
-(\S 5) underperformed plain BM25 on every tested configuration; true
-field weighting (\S 6 of the earlier section / title-vs-abstract
-experiment) showed a real gain but depends on a title field the actual
+(\S 4) underperformed plain BM25 on every tested configuration; true
+field weighting (\S 5, the title-vs-abstract experiment) showed a real
+gain but depends on a title field the actual
 corpus contract doesn't guarantee, and the safe fallback heuristic
-recovered only 5.5\% of that gain --- not worth shipping.}
+recovered only 5.5\% of that gain --- not worth shipping. Block-Max WAND
+(\S\ref{sec:pruning}) and SPIMI-style build-time inversion
+(\S\ref{sec:pruning}) were also considered and rejected: the former
+conflicts structurally with the blend's per-query min-max normalization,
+and the latter solves a multi-pass/external-sort problem this
+single-process, in-memory implementation doesn't have.}
 
 \section{Correctness Testing}
 
@@ -866,7 +1110,7 @@ the "Correctness of required components" grading criterion
 against known small examples, not leaderboard score alone"):
 
 \begin{itemize}
-\item \texttt{tests/test\_scorers.py} (22 tests): BM25 and TF-IDF/cosine
+\item \texttt{tests/test\_scorers.py} (26 tests): BM25 and TF-IDF/cosine
 VSM checked against values computed independently by hand from each
 module's own documented formula on a shared 3-document toy corpus (not
 by calling the function under test to generate its own "expected"
@@ -876,10 +1120,23 @@ compared with \texttt{math.isclose}. Also covers Boolean AND/OR set
 semantics, edge cases (empty query, out-of-vocabulary terms, unknown
 Boolean mode), and \texttt{custom\_scorer.py}'s blend wiring (verified
 against the now-trusted \texttt{raw\_scores()} outputs, layering the
-composition check on top of the formula check).
-\item \texttt{tests/test\_index\_persistence.py} (11 tests): VByte
-round-trip correctness and full \texttt{InvertedIndex.save()}/
-\texttt{load()} round-trip fidelity (\S 2).
+composition check on top of the formula check). Four of the 26 cover
+\texttt{boolean\_vsm.raw\_scores\_for\_candidates()}
+(\S\ref{sec:pruning}): matches \texttt{raw\_scores()} on a shared
+candidate set, excludes documents outside the pool, handles an empty
+pool/query, and --- at the \texttt{custom\_scorer.score()} level --- pins
+that a small \texttt{vsm\_pool\_size} actually changes the blended score
+for a non-pool document, not just that the parameter exists and is
+silently ignored.
+\item \texttt{tests/test\_index\_persistence.py} (21 tests): VByte
+round-trip correctness, full \texttt{InvertedIndex.save()}/
+\texttt{load()} round-trip fidelity (\S 1), and --- added with
+\S\ref{sec:tfcodes}'s tf-code/front-coding follow-up --- round-trip and
+edge-case tests for \texttt{submission/bitpack.py} (2-bit packing,
+including the padding-bits-past-declared-count case) and
+\texttt{submission/frontcode.py} (hand-computed shared-prefix lengths,
+not just round-trip, plus the empty/single-term/no-shared-prefix
+edge cases).
 \end{itemize}
 
 \noindent Neither is wired into \texttt{scripts/smoke\_test.sh} or
@@ -903,7 +1160,21 @@ the VByte index compression (\texttt{submission/vbyte.py} and the
 \texttt{save()}/\texttt{load()} rewrite in \texttt{submission/indexer.py}),
 their accompanying unit tests, and this report file itself were written
 with Claude Code's assistance, under the student's direction and review
-at each step. \todo{An earlier session (git commit \texttt{40108e5},
+at each step. In a later session on the same repository: the 2-bit
+tf-code and front-coded dictionary compression
+(\texttt{submission/bitpack.py}, \texttt{submission/frontcode.py}, and
+the corresponding rewrite of \texttt{InvertedIndex.save()}/\texttt{load()}
+in \texttt{submission/indexer.py}, \S\ref{sec:tfcodes}), the query-latency
+profiling and both follow-up fixes (\texttt{heapq.nlargest} and the
+BM25-top-$N$ VSM candidate pool in \texttt{submission/bm25.py},
+\texttt{submission/boolean\_vsm.py}, \texttt{submission/custom\_scorer.py},
+\S\ref{sec:pruning}), \texttt{scripts/tune\_vsm\_pool\_size.py}, their
+accompanying unit tests, and the corresponding updates to this report
+were likewise written with Claude Code's assistance, under the student's
+direction and review at each step --- including the decision, made by
+the student, of what to try (from a shortlist the student narrowed) and
+what to reject (Block-Max WAND, SPIMI) after seeing the profiling
+evidence. \todo{An earlier session (git commit \texttt{40108e5},
 ``migrated the claude generated code'') produced the initial
 \texttt{bm25.py}/\texttt{boolean\_vsm.py} implementations before this
 report-writing session began --- describe that session's AI use here
@@ -928,5 +1199,28 @@ Rocchio PRF are original implementations of published formulas (Robertson
 \& Walker 1992; Robertson \& Zaragoza 2009; Rocchio 1971) against this
 repository's own data structures, with no external search/indexing
 library used, per assignment Section 8.
+
+The 2-bit tf-code/escape-list encoding (\texttt{submission/bitpack.py},
+\S\ref{sec:tfcodes}) is an original design choice motivated directly by
+the measured tf distribution on this corpus (72.6\% of postings have
+tf==1), not copied from a specific published scheme --- it is a small,
+alphabet-size-4 code in the same general family as classic
+frequency-skewed integer codes (e.g.\ Golomb/Rice coding), but simpler
+and tailored to this specific, measured distribution rather than a
+general-purpose implementation of either. The front-coded dictionary
+(\texttt{submission/frontcode.py}) follows the general front-coding
+technique for sorted-string dictionaries described in Manning, Raghavan
+\& Sch\"utze, \emph{Introduction to Information Retrieval}, Chapter 5
+(dictionary compression) --- again a standard, widely-taught technique,
+implemented here without the block-based restart points the textbook
+version usually includes, since this codebase's \texttt{load()} never
+needs random access into the dictionary (see \S\ref{sec:tfcodes} for why
+that omission is deliberate, not an oversight). The candidate-set-pruning
+fixes in \S\ref{sec:pruning} (\texttt{heapq.nlargest}, and restricting
+VSM to a BM25-derived candidate pool) use Python's standard-library
+\texttt{heapq} module and an original, from-scratch pooling design
+against this repository's own scorer interfaces --- not an implementation
+of Block-Max WAND, which was considered and explicitly not implemented
+(\S\ref{sec:pruning}).
 
 \end{document}
