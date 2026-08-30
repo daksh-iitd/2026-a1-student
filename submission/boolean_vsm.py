@@ -27,8 +27,9 @@ Two independent pieces to implement:
 Both pieces should read from the same InvertedIndex you build in
 indexer.py.
 """
+import heapq
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from submission.indexer import InvertedIndex, tokenize
 
@@ -90,20 +91,34 @@ def boolean_search(query: str, mode: str = "and") -> List[str]:
     return list(result)
 
 
-def raw_scores(query: str) -> Dict[str, float]:
-    """Every matched doc_id's TF-IDF cosine similarity to `query`,
-    unsorted. Factored out of vsm_score() so callers combining this with
-    another ranker (submission/custom_scorer.py) can skip a sort that
-    would be immediately discarded — see bm25.raw_scores()'s docstring
-    for the profiling behind this."""
-    if _INDEX is None:
-        raise RuntimeError("boolean_vsm.build() must be called before boolean_vsm.raw_scores()/vsm_score().")
-
+def _query_vector(query: str) -> Tuple[Dict[str, float], float]:
+    """TF-IDF query weights and the query vector's norm, shared by
+    raw_scores() and raw_scores_for_candidates() so both stay consistent
+    with exactly the same query-side weighting."""
     q_tf: Dict[str, int] = {}
     for term in tokenize(query):
         q_tf[term] = q_tf.get(term, 0) + 1
     q_weights = {term: tf * _IDF.get(term, 0.0) for term, tf in q_tf.items()}
     q_norm = math.sqrt(sum(w * w for w in q_weights.values()))
+    return q_weights, q_norm
+
+
+def raw_scores(query: str) -> Dict[str, float]:
+    """Every matched doc_id's TF-IDF cosine similarity to `query`,
+    unsorted. Factored out of vsm_score() so callers combining this with
+    another ranker (submission/custom_scorer.py) can skip a sort that
+    would be immediately discarded — see bm25.raw_scores()'s docstring
+    for the profiling behind this.
+
+    Walks every posting of every query term, so its cost scales with how
+    many documents the query matches (profiled: 18ms/query on the full
+    corpus, matching 37K-101K documents for a typical dev query) — see
+    raw_scores_for_candidates() for a cheaper variant when only a
+    specific, smaller set of documents needs scoring."""
+    if _INDEX is None:
+        raise RuntimeError("boolean_vsm.build() must be called before boolean_vsm.raw_scores()/vsm_score().")
+
+    q_weights, q_norm = _query_vector(query)
     if q_norm == 0:
         return {}
 
@@ -127,9 +142,53 @@ def raw_scores(query: str) -> Dict[str, float]:
     return scores
 
 
+def raw_scores_for_candidates(query: str, candidate_ids: Iterable[str]) -> Dict[str, float]:
+    """Same TF-IDF cosine similarity as raw_scores(), but computed only
+    for `candidate_ids` instead of every document any query term
+    matches — used by submission/custom_scorer.py to restrict the VSM
+    pass to a pre-filtered candidate pool (e.g. BM25's own top-N) rather
+    than rescoring the full matched set a second time.
+
+    Loop order is inverted relative to raw_scores() on purpose: for a
+    small `candidate_ids` (hundreds) against a query with only a handful
+    of terms, iterating candidates-then-terms and doing a dict lookup per
+    (candidate, term) pair is far cheaper than raw_scores()'s
+    terms-then-full-postings walk, which touches every one of a term's
+    (potentially tens of thousands of) postings regardless of whether
+    that document is a candidate at all."""
+    if _INDEX is None:
+        raise RuntimeError(
+            "boolean_vsm.build() must be called before boolean_vsm.raw_scores_for_candidates()."
+        )
+
+    q_weights, q_norm = _query_vector(query)
+    if q_norm == 0:
+        return {}
+
+    scores: Dict[str, float] = {}
+    for doc_id in candidate_ids:
+        dnorm = _DOC_NORMS.get(doc_id, 0.0)
+        if dnorm == 0:
+            continue
+        dot = 0.0
+        for term, qw in q_weights.items():
+            if qw == 0:
+                continue
+            postings = _INDEX.postings.get(term)
+            if not postings:
+                continue
+            tf = postings.get(doc_id)
+            if tf:
+                dot += qw * (tf * _IDF[term])
+        if dot:
+            scores[doc_id] = dot / (dnorm * q_norm)
+    return scores
+
+
 def vsm_score(query: str, k: int) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs for `query`, ranked by
-    TF-IDF cosine similarity, highest score first."""
+    TF-IDF cosine similarity, highest score first. Uses heapq.nlargest
+    rather than a full sort — see bm25.score()'s docstring for the
+    profiling behind this; same stable tie-break as sorted()'s."""
     scores = raw_scores(query)
-    scored = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-    return scored[:k]
+    return heapq.nlargest(k, scores.items(), key=lambda item: item[1])

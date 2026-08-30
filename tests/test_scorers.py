@@ -229,6 +229,40 @@ def test_vsm_unknown_term_only_query_returns_no_results():
     assert boolean_vsm.vsm_score("xyzzy", k=10) == []
 
 
+def test_vsm_raw_scores_for_candidates_matches_raw_scores_restricted_to_the_same_set():
+    # raw_scores_for_candidates() takes a different code path (candidates
+    # outer loop, terms inner loop) specifically for speed on a small
+    # candidate pool (submission/custom_scorer.py's vsm_pool_size) -- it
+    # must still compute the exact same cosine similarity as raw_scores()
+    # for any candidate both would have scored anyway.
+    index = _build_index()
+    boolean_vsm.build(index)
+    full = boolean_vsm.raw_scores("cat dog bird")
+    restricted = boolean_vsm.raw_scores_for_candidates("cat dog bird", ["d1", "d3"])
+    assert set(restricted) <= {"d1", "d3"}
+    for doc_id in restricted:
+        assert math.isclose(restricted[doc_id], full[doc_id], rel_tol=1e-9)
+
+
+def test_vsm_raw_scores_for_candidates_excludes_documents_outside_the_pool():
+    # d2 matches "dog" and would appear in the unrestricted raw_scores(),
+    # but is deliberately left out of the candidate pool here -- it must
+    # not appear in the restricted result even though it's a real match.
+    index = _build_index()
+    boolean_vsm.build(index)
+    full = boolean_vsm.raw_scores("dog")
+    assert "d2" in full  # sanity check on the fixture itself
+    restricted = boolean_vsm.raw_scores_for_candidates("dog", ["d1"])
+    assert "d2" not in restricted
+
+
+def test_vsm_raw_scores_for_candidates_empty_pool_or_query():
+    index = _build_index()
+    boolean_vsm.build(index)
+    assert boolean_vsm.raw_scores_for_candidates("cat dog", []) == {}
+    assert boolean_vsm.raw_scores_for_candidates("xyzzy", ["d1", "d2", "d3"]) == {}
+
+
 # ---------------------------------------------------------------------------
 # Cross-cutting: determinism and result well-formedness (mirrors the
 # harness's own conformance checks, applied directly to each scorer
@@ -314,6 +348,35 @@ def test_custom_scorer_gamma_zero_ignores_coordination_bonus():
     default_gamma = custom_scorer.score("cat dog", k=10, k1=1.2, b=0.75)
     explicit_zero_gamma = custom_scorer.score("cat dog", k=10, k1=1.2, b=0.75, gamma=0.0)
     assert default_gamma == explicit_zero_gamma
+
+
+def test_custom_scorer_vsm_pool_size_restricts_vsm_to_bm25s_top_candidates():
+    # vsm_pool_size=1 should only let BM25's single top-scoring candidate
+    # keep a real VSM contribution; every other matched document must be
+    # blended as if VSM found nothing for it (vsm_norm defaults to 0.0),
+    # even though boolean_vsm.raw_scores() unrestricted would have scored
+    # it. This pins that the pool restriction actually changes behavior
+    # -- not just that it exists and happens to be a no-op.
+    index = _build_index()
+    custom_scorer.build(index)
+
+    k1, b, delta, w = 1.2, 0.75, 0.0, 0.5
+    bm25_raw = bm25.raw_scores("cat dog", k1=k1, b=b, delta=delta)
+    top_doc_id = max(bm25_raw, key=bm25_raw.get)
+
+    restricted = dict(custom_scorer.score("cat dog", k=10, k1=k1, b=b, delta=delta, w=w, vsm_pool_size=1))
+    unrestricted = dict(
+        custom_scorer.score("cat dog", k=10, k1=k1, b=b, delta=delta, w=w, vsm_pool_size=1000)
+    )
+
+    assert set(restricted) == set(unrestricted) == set(bm25_raw)
+    # The pool winner's score is unaffected by the restriction...
+    assert math.isclose(restricted[top_doc_id], unrestricted[top_doc_id], rel_tol=1e-9)
+    # ...but at least one other matched document must differ, since its
+    # real VSM contribution was dropped to 0.0 by the pool restriction.
+    others = set(bm25_raw) - {top_doc_id}
+    assert others, "fixture must have more than one BM25 candidate for this test to be meaningful"
+    assert any(not math.isclose(restricted[d], unrestricted[d], rel_tol=1e-9) for d in others)
 
 
 def test_custom_scorer_falls_back_to_bm25_only_when_vsm_finds_nothing():

@@ -34,6 +34,7 @@ delta=0.75, w=0.8 — comparable in size to the original k1/b tuning gain.
 Cost: this runs a full VSM pass per query in addition to BM25's, so mean
 query latency is roughly double a bare bm25.score() call.
 """
+import heapq
 from typing import Dict, List, Optional, Tuple
 
 from submission import bm25, boolean_vsm
@@ -96,13 +97,28 @@ def score(
     delta: float = 0.75,
     w: float = 0.8,
     gamma: float = 0.0,
+    vsm_pool_size: int = 5000,
 ) -> List[Tuple[str, float]]:
     """Return up to k (doc_id, score) pairs, ranked by the BM25+/VSM
     blend described in the module docstring, plus `gamma` times the
     coordination-level bonus (_coordination_levels()) added on top.
     `gamma=0.0` (default) reproduces the plain BM25+/VSM blend exactly —
     see scripts/tune_coordination.py for the dev-set sweep that decides
-    whether a nonzero gamma is actually worth shipping."""
+    whether a nonzero gamma is actually worth shipping.
+
+    `vsm_pool_size` restricts the VSM pass to the top `vsm_pool_size`
+    BM25+ candidates (boolean_vsm.raw_scores_for_candidates()) instead of
+    rescoring every document any query term matches
+    (boolean_vsm.raw_scores()) a second time — a document outside the
+    pool is scored as VSM=0, same as one VSM found no term overlap with
+    at all. Swept on the full dev set directly against nDCG@10 (not just
+    assumed safe): pool=1000 cost ~0.003-0.004 nDCG@10 versus
+    unrestricted; pool=5000 matched or slightly *exceeded* the
+    unrestricted score (0.692 vs 0.691, both runs, small differences
+    from the pool's candidate-set-dependent min-max normalization
+    changing per query, not a bug) while cutting mean query latency from
+    159.5ms to 65.9ms in the same sweep (~2.4x) — see report.tex's
+    efficiency section for the full pool-size table."""
     if not _BUILT:
         raise RuntimeError("custom_scorer.build() must be called before custom_scorer.score().")
 
@@ -110,19 +126,22 @@ def score(
     # doc_id's score, UNSORTED — score()/vsm_score() would sort the same
     # dict and then have that sort thrown away here anyway, since
     # normalization needs the whole set (not just a top-k) and the final
-    # ranking is only decided by the one sort below, over the combined
-    # scores. Calling the *_score() wrappers instead cost ~80ms/query of
-    # pure wasted sorting on the full corpus — see report.tex's
-    # "Improving Query Latency" section.
+    # ranking is only decided by the one heapq.nlargest below, over the
+    # combined scores. Calling the *_score() wrappers instead cost
+    # ~80ms/query of pure wasted sorting on the full corpus — see
+    # report.tex's "Improving Query Latency" section.
     bm25_raw = bm25.raw_scores(query, k1=k1, b=b, delta=delta)
-    vsm_raw = boolean_vsm.raw_scores(query)
+    vsm_candidate_ids = [
+        doc_id for doc_id, _ in heapq.nlargest(vsm_pool_size, bm25_raw.items(), key=lambda item: item[1])
+    ]
+    vsm_raw = boolean_vsm.raw_scores_for_candidates(query, vsm_candidate_ids)
 
     bm25_norm = _minmax_normalize(bm25_raw)
     vsm_norm = _minmax_normalize(vsm_raw)
     coordination = _coordination_levels(query) if gamma else {}
 
     candidates = set(bm25_norm) | set(vsm_norm)
-    combined = [
+    combined = (
         (
             doc_id,
             w * bm25_norm.get(doc_id, 0.0)
@@ -130,6 +149,5 @@ def score(
             + gamma * coordination.get(doc_id, 0.0),
         )
         for doc_id in candidates
-    ]
-    combined.sort(key=lambda item: item[1], reverse=True)
-    return combined[:k]
+    )
+    return heapq.nlargest(k, combined, key=lambda item: item[1])

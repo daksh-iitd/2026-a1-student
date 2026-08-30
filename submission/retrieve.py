@@ -102,7 +102,12 @@ def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
     k1/b/delta/w below were chosen by grid search on the released dev
     topics/qrels (scripts/tune_bm25.py, scripts/tune_bm25_vsm_blend.py,
     scripts/tune_bm25_plus.py) — re-run those and update these values if
-    the corpus or dev topics change.
+    the corpus or dev topics change. vsm_pool_size=5000 (restricting the
+    VSM pass to BM25+'s own top-5000 candidates rather than rescoring
+    every matched document) was swept the same way
+    (scripts/tune_vsm_pool_size.py): it matched or slightly exceeded the
+    unrestricted nDCG@10 on dev while cutting mean query latency by
+    ~2.3-2.4x in that sweep — see report.tex's efficiency section.
     """
     if not _LOADED:
         raise RuntimeError(
@@ -113,4 +118,4 @@ def retrieve(query: str, k: int = 10) -> List[Tuple[str, float]]:
             "manually, do the same."
         )
 
-    return custom_scorer.score(query, k, k1=2.5, b=0.6, delta=0.75, w=0.8)
+    return custom_scorer.score(query, k, k1=2.5, b=0.6, delta=0.75, w=0.8, vsm_pool_size=5000)
